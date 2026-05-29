@@ -1,33 +1,35 @@
 """
-Phase 1 Gate Check — qualitative evaluation of a trained pix2pix checkpoint.
+Phase 1 Gate Check — evaluate a trained pix2pix checkpoint on unseen test data.
 
-Success criteria (from ROADMAP):
-  1. No mode collapse — different inputs produce different outputs
-  2. Outputs are sharp (not blurry averages)
-  3. 👁️  VISUAL: generated sketches look like recognizable face drawings
+Two modes:
+  quick  → 10 random test photos, generate, save grid (visual check)
+  full   → all test photos, compare against ground-truth sketches (L1 metric)
 
-Since we use 100% data for training (no val split), the primary metric is
-visual quality. Look at outputs/phase1_eval_grid.png — top row is input
-photos, bottom row is generated sketches.
+The test set (data/test/) is NEVER used in training — L1 here is genuine generalization.
 
 Usage:
-  python src/evaluate.py --checkpoint checkpoints/pix2pix_best.pt
-  python src/evaluate.py --checkpoint checkpoints/pix2pix_best.pt --device cuda
+  python src/evaluate.py --checkpoint checkpoints/pix2pix_best.pt --mode quick
+  python src/evaluate.py --checkpoint checkpoints/pix2pix_best.pt --mode full
 """
 
 import argparse
+import os
+import random
 import sys
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.utils import save_image, make_grid
+from torchvision import transforms as T
+from PIL import Image
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from unet import UNetGenerator
-from data_loader import FaceDataset, get_transformations, DATASET_MEAN, DATASET_STD
+from data_loader import DATASET_MEAN, DATASET_STD
 from sample import postprocess_tensor
 
 
@@ -52,163 +54,196 @@ def load_checkpoint(ckpt_path, device):
     return gen, epoch, train_l1
 
 
-def evaluate(generator, checkpoint_path, device='cpu', data_dir="data/dataset"):
-    """Run Phase 1 gate checks. Qualitative — look at the grid."""
+def preprocess(img_path, size=(256, 256)):
+    img = Image.open(img_path).convert('RGB')
+    tfs = T.Compose([T.Resize(size), T.ToTensor(),
+                     T.Normalize(DATASET_MEAN, DATASET_STD)])
+    return tfs(img).unsqueeze(0)
 
-    print(f"\n{'='*60}")
-    print(f"📋  Phase 1 Gate Evaluation")
-    print(f"{'='*60}")
 
-    gen, epoch, train_l1 = load_checkpoint(checkpoint_path, device)
-    n_params = sum(p.numel() for p in gen.parameters())
-    print(f"\n  Checkpoint:  {Path(checkpoint_path).name}")
-    print(f"  Epoch:       {epoch}")
-    print(f"  Params:      {n_params:,}")
-    print(f"  Train G_L1:  {train_l1}")
+def get_test_pairs(test_dir):
+    """Pair test photos with test sketches by numeric suffix.
+    photo: imageXXXX.jpg  →  sketch: sketchXXXX.jpg
+    If no sketch exists, it's still included (for quick mode).
+    """
+    photo_dir = Path(test_dir) / "photos"
+    sketch_dir = Path(test_dir) / "sketches"
 
-    # ── Load dataset ──
-    dataset = FaceDataset(root_dir=data_dir)
-    n_pairs = len(dataset)
-    print(f"  Dataset:     {n_pairs} pairs (100% train)")
+    if not photo_dir.exists():
+        return []
 
-    main_tf, _ = get_transformations(
-        DATASET_MEAN, DATASET_STD, size=(256, 256),
-    )
+    pairs = []
+    for f in sorted(photo_dir.iterdir()):
+        if not f.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp', '.bmp'):
+            continue
+        # Match: imageXXXX → sketchXXXX
+        base = f.stem  # e.g. "image0001"
+        if base.startswith("image"):
+            num = base[len("image"):]  # "0001"
+            sketch_path = sketch_dir / f"sketch{num}{f.suffix}"
+        elif base.startswith("sketch"):
+            continue  # skip sketches in photos dir by accident
+        else:
+            sketch_path = sketch_dir / f.name
 
-    all_ok = True
+        pairs.append({
+            "photo": str(f),
+            "sketch": str(sketch_path) if sketch_path.exists() else None,
+            "name": f.stem,
+        })
 
-    # ═══════════════════════════════════════════════════════════
-    # CHECK 1: Mode Collapse
-    # ═══════════════════════════════════════════════════════════
-    print(f"\n  ── Check 1: Mode Collapse ──")
+    return pairs
 
-    indices = [0, 10, 20, 30, 40, 50, 60, 70]
-    images = []
-    with torch.no_grad():
-        for idx in indices:
-            photo, _ = dataset[idx]
-            photo_t = main_tf(photo).unsqueeze(0).to(device)
-            fake = gen(photo_t)
-            images.append(fake.cpu())
 
-    diffs = []
-    for i in range(len(images)):
-        for j in range(i + 1, len(images)):
-            diff = (images[i] - images[j]).pow(2).mean().sqrt().item()
-            diffs.append(diff)
+# ═══════════════════════════════════════════════════════════════
+#  MODE 1: QUICK — 10 random photos, visual check
+# ═══════════════════════════════════════════════════════════════
 
-    avg_diff = sum(diffs) / len(diffs)
-    min_diff = min(diffs)
-    collapse_ok = min_diff > 0.01
+def evaluate_quick(gen, test_pairs, device, num_samples=10):
+    print(f"\n  {'='*56}")
+    print(f"  👁️  QUICK CHECK — {num_samples} random test photos")
+    print(f"  {'='*56}")
 
-    status = "✅" if collapse_ok else "❌ MODE COLLAPSE"
-    print(f"  Pairwise L2 diff: avg={avg_diff:.4f}  min={min_diff:.4f}  [{status}]")
-    if not collapse_ok:
-        print(f"  ⚠️  All outputs look the same — generator collapsed.")
-        all_ok = False
+    n = min(num_samples, len(test_pairs))
+    samples = random.sample(test_pairs, n)
 
-    # ═══════════════════════════════════════════════════════════
-    # CHECK 2: Output Sharpness (Laplacian variance)
-    # ═══════════════════════════════════════════════════════════
-    print(f"\n  ── Check 2: Sharpness ──")
-
-    laplacian = torch.tensor([
-        [0, 1, 0],
-        [1, -4, 1],
-        [0, 1, 0],
-    ], dtype=torch.float32).view(1, 1, 3, 3).to(device)
-
-    variances = []
-    with torch.no_grad():
-        for idx in tqdm(range(min(n_pairs, 30)), desc="  Computing sharpness",
-                         leave=False):
-            photo, _ = dataset[idx]
-            photo_t = main_tf(photo).unsqueeze(0).to(device)
-            fake = gen(photo_t)
-            for c in range(3):
-                channel = fake[:, c:c+1, :, :]
-                lap = F.conv2d(channel, laplacian, padding=1)
-                variances.append(lap.var().item())
-
-    avg_var = sum(variances) / len(variances)
-    sharp_ok = avg_var > 0.001
-
-    status = "✅ sharp" if sharp_ok else "⚠️  blurry"
-    print(f"  Laplacian variance: {avg_var:.6f}  [{status}]")
-    if not sharp_ok:
-        print(f"  💡  Outputs are blurry — need more adversarial training.")
-
-    # ═══════════════════════════════════════════════════════════
-    # CHECK 3: Output Range
-    # ═══════════════════════════════════════════════════════════
-    print(f"\n  ── Check 3: Output Range ──")
-    with torch.no_grad():
-        photo, _ = dataset[0]
-        photo_t = main_tf(photo).unsqueeze(0).to(device)
-        fake = gen(photo_t)
-    vmin, vmax = fake.min().item(), fake.max().item()
-    range_ok = vmin > -1.01 and vmax < 1.01
-
-    status = "✅" if range_ok else "❌"
-    print(f"  Range: [{vmin:.3f}, {vmax:.3f}]  [{status}]")
-
-    # ═══════════════════════════════════════════════════════════
-    # 👁️  PRIMARY: Sample Grid
-    # ═══════════════════════════════════════════════════════════
-    print(f"\n  ── 👁️  PRIMARY: Sample Grid ──")
-
-    num_show = 8
     photos_list, fakes_list = [], []
-    with torch.no_grad():
-        for idx in range(min(n_pairs, num_show)):
-            photo, _ = dataset[idx]
-            photo_t = main_tf(photo).unsqueeze(0).to(device)
+    for s in tqdm(samples, desc="  Generating", leave=False):
+        photo_t = preprocess(s["photo"]).to(device)
+        with torch.no_grad():
             fake = gen(photo_t)
-            photos_list.append(postprocess_tensor(photo_t.cpu()))
-            fakes_list.append(postprocess_tensor(fake.cpu()))
+        photos_list.append(postprocess_tensor(photo_t.cpu()))
+        fakes_list.append(postprocess_tensor(fake.cpu()))
 
-    photos_grid = make_grid(torch.cat(photos_list), nrow=num_show)
-    fakes_grid = make_grid(torch.cat(fakes_list), nrow=num_show)
+    # Grid: top = photos, bottom = generated
+    photos_grid = make_grid(torch.cat(photos_list), nrow=n)
+    fakes_grid = make_grid(torch.cat(fakes_list), nrow=n)
     combined = torch.cat([photos_grid, fakes_grid], dim=1)
 
     out_dir = Path("outputs")
     out_dir.mkdir(exist_ok=True)
-    save_path = out_dir / "phase1_eval_grid.png"
-    save_image(combined, save_path)
+    path = out_dir / "phase1_quick_eval.png"
+    save_image(combined, path)
 
-    # ═══════════════════════════════════════════════════════════
-    # VERDICT
-    # ═══════════════════════════════════════════════════════════
-    print(f"\n{'='*60}")
-    print(f"📊  VERDICT")
-    print(f"{'='*60}")
-    print(f"  Checkpoint:      {Path(checkpoint_path).name} (epoch {epoch})")
-    print(f"  Mode collapse:   {'✅ none' if collapse_ok else '❌'}")
-    print(f"  Sharpness:       {'✅ good' if sharp_ok else '⚠️  blurry'}")
-    print(f"  Output range:    {'✅' if range_ok else '❌'}")
-    print(f"")
-    print(f"  👁️  Sample grid:  {save_path}")
-    print(f"     Top row = input photos, bottom row = generated sketches")
-    print(f"")
-    print(f"  ❓  Do the generated sketches look like recognizable")
-    print(f"     pencil drawings of the faces above?")
-    print(f"")
-    print(f"     YES → 🎉  PHASE 1 PASS — proceed to Phase 2")
-    print(f"     NO  → ⚠️   Continue training, tune hyperparams")
-    print(f"{'='*60}\n")
+    print(f"\n  📸  Saved: {path}")
+    print(f"      Top row  = {n} test photos (unseen)")
+    print(f"      Bot row  = generated sketches")
+    print(f"\n  ❓  Do the generated sketches look like recognizable")
+    print(f"     drawings of the faces above?")
+    print(f"     YES → good  |  NO → needs more training")
 
-    return all_ok
 
+# ═══════════════════════════════════════════════════════════════
+#  MODE 2: FULL — all test photos vs ground-truth sketches
+# ═══════════════════════════════════════════════════════════════
+
+def evaluate_full(gen, test_pairs, device):
+    print(f"\n  {'='*56}")
+    print(f"  📏  FULL EVALUATION — all test pairs (photo → sketch)")
+    print(f"  {'='*56}")
+
+    # Only pairs that have a ground-truth sketch
+    paired = [p for p in test_pairs if p["sketch"] is not None]
+    if not paired:
+        print(f"  ❌  No paired (photo, sketch) found in data/test/.")
+        print(f"      Expected: photos/imageXXXX.jpg + sketches/sketchXXXX.jpg")
+        return
+
+    print(f"  Paired test samples: {len(paired)}")
+    l1_fn = nn.L1Loss()
+
+    total_l1 = 0.0
+    fakes_for_grid = []
+    reals_for_grid = []
+
+    with torch.no_grad():
+        for p in tqdm(paired, desc="  Evaluating", leave=False):
+            photo_t = preprocess(p["photo"]).to(device)
+            sketch_t = preprocess(p["sketch"]).to(device)
+            fake = gen(photo_t)
+            total_l1 += l1_fn(fake, sketch_t).item()
+
+            # Save first 8 for grid
+            if len(fakes_for_grid) < 8:
+                fakes_for_grid.append(postprocess_tensor(fake.cpu()))
+                reals_for_grid.append(postprocess_tensor(sketch_t.cpu()))
+
+    avg_l1 = total_l1 / len(paired)
+
+    # Grid: generated vs ground-truth
+    fakes_grid = make_grid(torch.cat(fakes_for_grid), nrow=8)
+    reals_grid = make_grid(torch.cat(reals_for_grid), nrow=8)
+    combined = torch.cat([fakes_grid, reals_grid], dim=1)
+
+    out_dir = Path("outputs")
+    out_dir.mkdir(exist_ok=True)
+    path = out_dir / "phase1_full_eval.png"
+    save_image(combined, path)
+
+    # Threshold (from ROADMAP: L1 < 0.1 on validation)
+    l1_pass = avg_l1 < 0.15
+    status = "✅ GOOD" if l1_pass else "❌ NEEDS WORK"
+
+    print(f"\n  📊  RESULTS (on unseen test set)")
+    print(f"      Test pairs:      {len(paired)}")
+    print(f"      Avg L1 loss:     {avg_l1:.4f}  [{status}]")
+    print(f"      Threshold:       < 0.15 (from pix2pix paper)")
+    print(f"      Comparison grid: {path}")
+    print(f"         Top row = generated  |  Bot row = ground-truth")
+    print(f"")
+
+    if not l1_pass:
+        print(f"  💡  L1 > 0.15 — model hasn't converged yet. Tips:")
+        print(f"      - Train more epochs (200 → 300)")
+        print(f"      - Increase λ_l1 (100 → 200)")
+        print(f"      - Check if G_L1 was still decreasing at final epoch")
+    else:
+        print(f"  🎉  L1 < 0.15 on unseen data — ready for Phase 2!")
+
+    return avg_l1
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phase 1 Gate Check")
     parser.add_argument("--checkpoint", required=True, help="Path to .pt checkpoint")
+    parser.add_argument("--mode", choices=["quick", "full"], default="quick",
+                        help="quick = 10 random photos | full = all pairs + L1")
     parser.add_argument("--device", default="cpu", help="Device: cuda or cpu")
-    parser.add_argument("--data-dir", default="data/dataset", help="Data directory")
+    parser.add_argument("--test-dir", default="data/test",
+                        help="Test data directory")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
 
-    ok = evaluate(None, args.checkpoint, device=device, data_dir=args.data_dir)
-    sys.exit(0 if ok else 1)
+    print(f"\n{'='*60}")
+    print(f"📋  Phase 1 Evaluation")
+    print(f"{'='*60}")
+    print(f"  Device: {device}")
+
+    # Load model
+    gen, epoch, train_l1 = load_checkpoint(args.checkpoint, device)
+    n_params = sum(p.numel() for p in gen.parameters())
+    print(f"  Checkpoint:  {Path(args.checkpoint).name}")
+    print(f"  Epoch:       {epoch}")
+    print(f"  Params:      {n_params:,}")
+    print(f"  Train G_L1:  {train_l1}")
+
+    # Load test pairs
+    test_pairs = get_test_pairs(args.test_dir)
+    paired = sum(1 for p in test_pairs if p["sketch"] is not None)
+    print(f"  Test data:   {len(test_pairs)} photos, {paired} have sketches")
+
+    if not test_pairs:
+        print(f"\n  ❌  No test photos found in {args.test_dir}/photos/")
+        sys.exit(1)
+
+    if args.mode == "quick":
+        evaluate_quick(gen, test_pairs, device)
+    else:
+        evaluate_full(gen, test_pairs, device)
+
+    print(f"{'='*60}\n")
