@@ -2,7 +2,7 @@
 
 > **Status:** ✅ Complete  
 > **Date:** May 2026  
-> **Checkpoint:** `checkpoints/pix2pix_best_2.pt` (epoch 197, ~454MB)
+> **Checkpoint:** `checkpoints/pix2pix_best.pt` (epoch 197, ~454MB)
 
 ---
 
@@ -58,7 +58,7 @@ Both runs converged to roughly the same L1 on unseen test data, suggesting the m
 ```
 checkpoints/
   pix2pix_best_1.pt    — run 1 best (epoch 155)
-  pix2pix_best_2.pt    — run 2 best (epoch 197) ← use this for Phase 2
+  pix2pix_best.pt    — run 2 best (epoch 197) ← use this for Phase 2
 
 samples/
   epoch_010.png ... epoch_200.png   — sample grids every 10 epochs
@@ -70,8 +70,8 @@ outputs/
 
 ## Next: Phase 2
 
-Load `pix2pix_best_2.pt` as pretrained weights, finetune on TwitterPicasso (184 caricature pairs). The photo→drawing mapping transfers — only the style needs to adapt. Fresh discriminator on a new dataset means adversarial signal will be active again.
+Load `pix2pix_best.pt` as pretrained weights, finetune on TwitterPicasso (184 caricature pairs). The photo→drawing mapping transfers — only the style needs to adapt. Fresh discriminator on a new dataset means adversarial signal will be active again.
 
 ```
-python src/train.py --mode train --resume checkpoints/pix2pix_best_2.pt --device cuda
+python src/train.py --mode train --resume checkpoints/pix2pix_best.pt --device cuda
 ```
