@@ -29,8 +29,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from unet import UNetGenerator
 from discriminator import PatchGANDiscriminator
 from data_loader import FaceDataset, get_dataloaders, get_transformations
-from data_loader import DATASET_MEAN, DATASET_STD
+from data_loader import DATASET_MEAN, DATASET_STD, FINETUNE_MEAN, FINETUNE_STD
 from sample import save_sample_grid
+from torchvision import transforms as T
 
 
 ROOT = Path(__file__).parent.parent
@@ -66,8 +67,8 @@ CONFIG = {
         "num_val_samples": 4, "log_interval": 10,
         "patience": 0,
     },
-    "train": {
-        "max_epochs": 200, "batch_size": 16, "image_size": 256,
+    "finetune": {
+        "max_epochs": 100, "batch_size": 16, "image_size": 256,
         "ngf": 64, "num_levels": 5, "ndf": 64,
         "sample_interval": 10, "save_interval": 20,
         "num_val_samples": 8, "log_interval": 50,
@@ -76,6 +77,10 @@ CONFIG = {
 
     # Optimizer (D gets lower LR to prevent overpowering G)
     "g_lr": 2e-4, "d_lr": 1e-4,
+
+    # Finetune overrides (active when mode=finetune or --finetune flag)
+    "finetune_lr": 5e-5,
+
     "adam_beta1": 0.5, "adam_beta2": 0.999,
 
     # Loss
@@ -137,14 +142,26 @@ def save_ckpt(gen, disc, g_opt, d_opt, epoch, loss, cfg, fname):
     return d / full_name
 
 
-def load_ckpt(path, gen, disc, g_opt, d_opt, device):
-    ckpt = torch.load(path, map_location=device)
+def load_pretrained_gen(path, gen, device):
+    """Load only generator weights from a checkpoint (for finetuning)."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     gen.load_state_dict(ckpt["generator"])
-    disc.load_state_dict(ckpt["discriminator"])
-    g_opt.load_state_dict(ckpt["g_optimizer"])
-    d_opt.load_state_dict(ckpt["d_optimizer"])
-    print(f"📂  Resumed from {path} (epoch {ckpt['epoch']})")
+    print(f"📂  Loaded pretrained G from {path} (epoch {ckpt['epoch']})")
+    print(f"    D and optimizers will start fresh (new style, new dataset)")
     return ckpt["epoch"]
+
+
+def get_finetune_augmentation(mean, std, size=(256, 256)):
+    """Phase 2: more aggressive augmentation for style transfer."""
+    return T.Compose([
+        T.Resize(size),
+        T.RandomHorizontalFlip(),
+        T.RandomRotation(degrees=30),
+        T.RandomAffine(degrees=0, translate=(0.05, 0.05),
+                       scale=(0.95, 1.05)),
+        T.ToTensor(),
+        T.Normalize(mean, std),
+    ])
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -232,7 +249,8 @@ def evaluate(gen, loader, device, n_batches=5):
 #  MAIN TRAINING
 # ═══════════════════════════════════════════════════════════════
 
-def train(config_path=None, resume_from=None, overfit_batch=False):
+def train(config_path=None, resume_from=None, finetune_from=None,
+          overfit_batch=False):
     cfg = CONFIG.copy()
     mode = cfg["mode"]
     S = cfg[mode]
@@ -282,6 +300,18 @@ def train(config_path=None, resume_from=None, overfit_batch=False):
                        "mean", "std"]:
                 if k in d: cfg[k] = d[k]
 
+    # ── Finetune mode: override config for Phase 2 ──
+    is_finetune = finetune_from is not None or mode == "finetune"
+    if is_finetune:
+        cfg["data_dir"] = "data/finetune"
+        cfg["mean"] = FINETUNE_MEAN
+        cfg["std"] = FINETUNE_STD
+        cfg["g_lr"] = 5e-5
+        cfg["d_lr"] = 2.5e-5
+        cfg["lambda_l1"] = 50
+        cfg["val_fraction"] = 0.1
+        print("    🎯  FINETUNE mode: Phase 1 G → Phase 2 caricatures")
+
     device = torch.device(cfg["device"])
     max_epochs = cfg["max_epochs"]
 
@@ -308,6 +338,11 @@ def train(config_path=None, resume_from=None, overfit_batch=False):
         cfg["mean"], cfg["std"],
         size=(cfg["image_size"], cfg["image_size"]),
     )
+    if is_finetune:
+        aug_tf = get_finetune_augmentation(
+            cfg["mean"], cfg["std"],
+            size=(cfg["image_size"], cfg["image_size"]),
+        )
     train_loader, val_loader, test_loader = get_dataloaders(
         batch_size=cfg["batch_size"],
         val_fraction=cfg["val_fraction"],
@@ -338,9 +373,16 @@ def train(config_path=None, resume_from=None, overfit_batch=False):
     d_opt = optim.Adam(disc.parameters(), lr=cfg["d_lr"],
                        betas=(cfg["adam_beta1"], cfg["adam_beta2"]))
 
-    # ── Resume ──
+    # ── Resume/Load pretrained ──
     start_epoch = 0
-    if resume_from:
+    if finetune_from:
+        finetune_path = Path(finetune_from)
+        if not finetune_path.exists():
+            finetune_path = ROOT / finetune_from
+        pretrained_epoch = load_pretrained_gen(str(finetune_path), gen, device)
+        # D starts fresh for new style, optimizers get new lr settings
+        print(f"    🧹  D re-initialized (fresh start for caricature style)")
+    elif resume_from:
         resume_path = Path(resume_from)
         if not resume_path.exists():
             resume_path = ROOT / resume_from
@@ -470,19 +512,21 @@ def _overfit_batch(gen, disc, loader, g_opt, d_opt, cfg, device):
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Train pix2pix GAN (Phase 1)")
-    p.add_argument("--mode", choices=["test", "train"], default="train",
-                   help="test = small local run | train = full training")
+    p = argparse.ArgumentParser(description="Train pix2pix GAN")
+    p.add_argument("--mode", choices=["test", "train", "finetune"], default="train",
+                   help="test=small local | train=full train | finetune=Phase 2 style")
     p.add_argument("--config", type=str, default=None,
                    help="YAML config file (overrides defaults)")
     p.add_argument("--resume", type=str, default=None,
-                   help="Resume from checkpoint")
+                   help="Resume from checkpoint (loads G+D+optimizers)")
+    p.add_argument("--finetune", type=str, default=None,
+                   help="Finetune from Phase 1 checkpoint (loads G only)")
     p.add_argument("--overfit-batch", action="store_true",
                    help="Overfit a single batch (sanity check)")
     p.add_argument("--device", type=str, default=None,
                    help="Device: cuda, mps, or cpu")
     p.add_argument("--name", type=str, default="",
-                   help="Prefix for checkpoint files (e.g. phase1_)")
+                   help="Prefix for checkpoint files")
     args = p.parse_args()
 
     if args.mode:
@@ -493,4 +537,5 @@ if __name__ == "__main__":
         CONFIG["ckpt_prefix"] = args.name
 
     train(config_path=args.config, resume_from=args.resume,
+          finetune_from=args.finetune,
           overfit_batch=args.overfit_batch)

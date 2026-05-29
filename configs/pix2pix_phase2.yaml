@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# Phase 2: pix2pix Finetune — Photo → Caricature (TwitterPicasso style)
+# Loads Phase 1 G weights, trains on 184 caricature pairs.
+# ---------------------------------------------------------------------------
+
+model:
+  image_size: 256
+  in_channels: 3
+  out_channels: 3
+
+  generator:
+    ngf: 64
+    num_levels: 5
+    use_dropout: true
+    dropout: 0.5
+
+  discriminator:
+    ndf: 64
+    n_layers: 3
+    use_batchnorm: true
+    leaky_slope: 0.2
+
+training:
+  batch_size: 16
+  num_epochs: 100
+
+  # Lower LR for finetuning (5e-5 vs 2e-4 in Phase 1)
+  g_lr: 5.0e-5
+  d_lr: 2.5e-5
+
+  # Adam betas
+  adam_beta1: 0.5
+  adam_beta2: 0.999
+
+  # Lean more on adversarial for style transfer (50 vs 100 in Phase 1)
+  lambda_l1: 50
+  lambda_adv: 1.0
+
+  # Stability
+  label_smoothing_real: 0.9
+  label_smoothing_fake: 0.0
+  grad_clip: 1.0
+
+  # Logging
+  log_interval: 50
+  save_interval: 20
+  sample_interval: 10
+  num_val_samples: 8
+
+data:
+  data_dir: "data/finetune"
+  val_fraction: 0.1
+  test_fraction: 0.0
+  num_workers: 2
+  use_augmentation: true
+
+  # Normalization constants for TwitterPicasso (computed from data/finetune/)
+  mean: [0.6433, 0.5730, 0.5383]
+  std: [0.2706, 0.2684, 0.2594]
