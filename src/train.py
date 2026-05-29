@@ -71,7 +71,7 @@ CONFIG = {
         "ngf": 64, "num_levels": 5, "ndf": 64,
         "sample_interval": 10, "save_interval": 20,
         "num_val_samples": 8, "log_interval": 50,
-        "patience": 10,
+        "patience": 20,
     },
 
     # Optimizer (D gets lower LR to prevent overpowering G)
