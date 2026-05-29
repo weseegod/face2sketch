@@ -240,7 +240,7 @@ def train(config_path=None, resume_from=None, overfit_batch=False):
     # Override with mode-specific settings
     for k in ["max_epochs", "batch_size", "image_size", "ngf", "num_levels",
               "ndf", "sample_interval", "save_interval", "num_val_samples",
-              "log_interval"]:
+              "log_interval", "patience"]:
         if k in S:
             cfg[k] = S[k]
 
@@ -264,7 +264,7 @@ def train(config_path=None, resume_from=None, overfit_batch=False):
             if "adam_beta1" in t: cfg["adam_beta1"] = t["adam_beta1"]
             if "adam_beta2" in t: cfg["adam_beta2"] = t["adam_beta2"]
             for k in ["save_interval", "sample_interval", "num_val_samples",
-                       "log_interval"]:
+                       "log_interval", "patience"]:
                 if k in t: cfg[k] = t[k]
         if yaml_cfg.get("model"):
             m = yaml_cfg["model"]
