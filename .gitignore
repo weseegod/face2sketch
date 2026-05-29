@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment
+venv/
+
+# Training artifacts
+checkpoints/
+outputs/
+
+# Data
+data/
+
+# System
+.DS_Store
+
+# Secrets
+.env
+wandb/
+resources/

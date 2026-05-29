@@ -1,0 +1,96 @@
+# ---------------------------------------------------------------------------
+# Phase 1: pix2pix GAN — Photo → Realistic Sketch
+# Paired image translation on CUHK + SKSF-A (322 pairs)
+# ---------------------------------------------------------------------------
+
+model:
+  # Input/output resolution (square, will resize all images to this)
+  image_size: 256
+  # Input channels: 3 for RGB photo
+  in_channels: 3
+  # Output channels: 3 for RGB sketch
+  out_channels: 3
+
+  # ── Generator (U-Net) ──
+  generator:
+    # Base feature dimension at first encoder level
+    ngf: 64
+    # Number of downsampling/upsampling levels (5 = 256→128→64→32→16→8)
+    num_levels: 5
+    # Use dropout in decoder (standard U-Net regularization)
+    use_dropout: true
+    # Dropout probability
+    dropout: 0.5
+
+  # ── Discriminator (PatchGAN) ──
+  discriminator:
+    # Base feature dimension
+    ndf: 64
+    # Number of discriminator layers (standard PatchGAN = 3 downsampling + 2 stride-1)
+    n_layers: 3
+    # Use BatchNorm in discriminator (standard for GANs)
+    use_batchnorm: true
+    # LeakyReLU negative slope
+    leaky_slope: 0.2
+
+training:
+  # Batch size — adjust for GPU memory. 16 fits easily on L4 at 256×256
+  batch_size: 16
+  # Number of epochs (not steps — paired datasets are small so epochs make sense)
+  num_epochs: 200
+
+  # ── Optimizer ──
+  # Learning rate for BOTH generator and discriminator
+  learning_rate: 2.0e-4
+  # Adam betas — β1=0.5 is standard for GANs (lower momentum for dynamic equilibrium)
+  adam_beta1: 0.5
+  adam_beta2: 0.999
+
+  # ── Loss weights ──
+  # L1 reconstruction weight (λ in the paper, typically 100)
+  # Higher = more structural accuracy, less adversarial sharpness
+  lambda_l1: 100
+  # Adversarial loss weight (1.0 for standard GAN loss)
+  lambda_adv: 1.0
+
+  # ── Stability ──
+  # One-sided label smoothing: real targets = 0.9 instead of 1.0
+  label_smoothing_real: 0.9
+  # Fake targets stay at 0.0 (don't smooth fake labels)
+  label_smoothing_fake: 0.0
+  # Gradient clipping norm (for both G and D)
+  grad_clip: 1.0
+
+  # ── Logging & Checkpointing ──
+  # Log loss values every N steps
+  log_interval: 100
+  # Save checkpoint every N epochs
+  save_interval: 20
+  # Generate sample images every N epochs
+  sample_interval: 10
+  # Number of validation images to generate during sampling
+  num_val_samples: 8
+
+data:
+  # Dataset root directory for Phase 1
+  data_dir: "data/dataset"
+  # Validation split fraction (from the 322 pairs)
+  val_fraction: 0.1
+  # Test split fraction
+  test_fraction: 0.05
+  # Number of dataloader workers
+  num_workers: 2
+  # Use data augmentation (random flip, rotation)
+  use_augmentation: true
+
+  # Normalization constants (precomputed from data/dataset/)
+  mean: [0.7108, 0.7137, 0.6957]
+  std: [0.2983, 0.2965, 0.3196]
+
+# ── Phase 2 (finetune) will override these values ──
+#   data_dir: "data/finetune"
+#   learning_rate: 5.0e-5
+#   num_epochs: 100
+#   lambda_l1: 50
+#   mean: [0.6433, 0.5730, 0.5383]
+#   std: [0.2706, 0.2684, 0.2594]
