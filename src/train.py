@@ -1,188 +1,461 @@
 """
-Phase 1: pix2pix GAN Training Script — ties together Generator,
-Discriminator, data loading, checkpointing, and visualization.
+Phase 1: pix2pix GAN Training Script.
+
+Modes:
+  test  → small image, few epochs  (local smoke test)
+  train → full config               (Colab / GPU training)
 
 Usage:
-  python src/train.py                                    # train with defaults
-  python src/train.py --config configs/pix2pix_phase1.yaml
-  python src/train.py --resume checkpoints/pix2pix_epoch_40.pt
-  python src/train.py --overfit-batch                    # sanity check on 1 batch
+  python src/train.py --mode test
+  python src/train.py --mode train --config configs/pix2pix_phase1.yaml
+  python src/train.py --resume checkpoints/pix2pix_epoch_040.pt
+"""
 
-═══════════════════════════════════════════════════════════════
-TRAINING LOOP STRUCTURE
-═══════════════════════════════════════════════════════════════
+import argparse
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
 
-def train_one_epoch(generator, discriminator, dataloader,
-                    g_optimizer, d_optimizer, config, epoch):
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import yaml
+from tqdm import tqdm
 
-    for batch_idx, (photo, real_sketch) in enumerate(dataloader):
+sys.path.insert(0, str(Path(__file__).parent))
+
+from unet import UNetGenerator
+from discriminator import PatchGANDiscriminator
+from data_loader import FaceDataset, get_dataloaders, get_transformations
+from data_loader import DATASET_MEAN, DATASET_STD
+from sample import save_sample_grid
+
+
+ROOT = Path(__file__).parent.parent
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CONFIG
+# ═══════════════════════════════════════════════════════════════
+
+CONFIG = {
+    "mode": "train",
+
+    # Model
+    "image_size": 256,
+    "in_channels": 3,
+    "out_channels": 3,
+    "ngf": 64, "num_levels": 5, "use_dropout": True, "dropout": 0.5,
+    "ndf": 64, "n_layers": 3,
+
+    # Data
+    "data_dir": "data/dataset",
+    "val_fraction": 0.1,
+    "test_fraction": 0.05,
+    "num_workers": 2,
+    "mean": DATASET_MEAN,
+    "std": DATASET_STD,
+
+    # Modes
+    "test": {
+        "max_epochs": 5, "batch_size": 8, "image_size": 128,
+        "ngf": 32, "num_levels": 4, "ndf": 32,
+        "sample_interval": 1, "save_interval": 5,
+        "num_val_samples": 4, "log_interval": 10,
+    },
+    "train": {
+        "max_epochs": 200, "batch_size": 16, "image_size": 256,
+        "ngf": 64, "num_levels": 5, "ndf": 64,
+        "sample_interval": 10, "save_interval": 20,
+        "num_val_samples": 8, "log_interval": 50,
+    },
+
+    # Optimizer
+    "learning_rate": 2e-4, "adam_beta1": 0.5, "adam_beta2": 0.999,
+
+    # Loss
+    "lambda_l1": 100, "lambda_adv": 1.0,
+    "label_smoothing_real": 0.9, "label_smoothing_fake": 0.0,
+    "grad_clip": 1.0,
+
+    # Paths
+    "checkpoint_dir": "checkpoints",
+    "sample_dir": "samples",
+
+    # Device
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MODEL CREATION
+# ═══════════════════════════════════════════════════════════════
+
+def create_models(cfg, device):
+    gen = UNetGenerator(
+        in_channels=cfg["in_channels"], out_channels=cfg["out_channels"],
+        ngf=cfg["ngf"], num_levels=cfg["num_levels"],
+        use_dropout=cfg["use_dropout"], dropout=cfg["dropout"],
+    ).to(device)
+
+    disc = PatchGANDiscriminator(
+        in_channels=cfg["in_channels"] + cfg["out_channels"],
+        ndf=cfg["ndf"], n_layers=cfg["n_layers"],
+    ).to(device)
+
+    return gen, disc
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CHECKPOINT
+# ═══════════════════════════════════════════════════════════════
+
+def save_ckpt(gen, disc, g_opt, d_opt, epoch, loss, cfg, fname):
+    d = ROOT / cfg["checkpoint_dir"]; d.mkdir(exist_ok=True)
+    prefix = cfg.get("ckpt_prefix", "")
+    full_name = f"{prefix}{fname}" if prefix else fname
+    torch.save({
+        "epoch": epoch,
+        "generator": gen.state_dict(),
+        "discriminator": disc.state_dict(),
+        "g_optimizer": g_opt.state_dict(),
+        "d_optimizer": d_opt.state_dict(),
+        "g_l1_loss": loss,
+        "config": {
+            "image_size": cfg["image_size"], "in_channels": cfg["in_channels"],
+            "out_channels": cfg["out_channels"], "ngf": cfg["ngf"],
+            "num_levels": cfg["num_levels"], "dropout": cfg["dropout"],
+            "ndf": cfg["ndf"], "n_layers": cfg["n_layers"],
+        },
+        "timestamp": datetime.now().isoformat(),
+    }, d / full_name)
+    return d / full_name
+
+
+def load_ckpt(path, gen, disc, g_opt, d_opt, device):
+    ckpt = torch.load(path, map_location=device)
+    gen.load_state_dict(ckpt["generator"])
+    disc.load_state_dict(ckpt["discriminator"])
+    g_opt.load_state_dict(ckpt["g_optimizer"])
+    d_opt.load_state_dict(ckpt["d_optimizer"])
+    print(f"📂  Resumed from {path} (epoch {ckpt['epoch']})")
+    return ckpt["epoch"]
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TRAINING LOOP
+# ═══════════════════════════════════════════════════════════════
+
+def train_one_epoch(gen, disc, dataloader, g_opt, d_opt, cfg, epoch, device):
+    gen.train(); disc.train()
+
+    bce = nn.BCELoss()
+    l1 = nn.L1Loss()
+    real_label = torch.tensor([cfg["label_smoothing_real"]], device=device)
+    fake_label = torch.tensor([cfg["label_smoothing_fake"]], device=device)
+    lambda_l1 = cfg["lambda_l1"]
+    lambda_adv = cfg["lambda_adv"]
+    grad_clip = cfg["grad_clip"]
+
+    m = {"d_loss": 0.0, "g_adv": 0.0, "g_l1": 0.0, "d_real": 0.0, "d_fake": 0.0}
+    n = len(dataloader)
+
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch:3d}", leave=False, unit="batch")
+    for batch_idx, (photo, real_sketch) in enumerate(pbar):
         photo = photo.to(device)
         real_sketch = real_sketch.to(device)
 
-        # ═══════════════════════════════════════════════════
-        # STEP 1: UPDATE DISCRIMINATOR
-        # ═══════════════════════════════════════════════════
-        #
-        # The discriminator learns to tell real pairs from fake pairs.
-
-        # Generate fake sketch from current generator
-        fake_sketch = generator(photo)
-
-        # Discriminator predictions on REAL pair
-        d_real = discriminator(photo, real_sketch)
-        d_real_loss = BCE(d_real, real_label_smoothed)
-
-        # Discriminator predictions on FAKE pair
-        # CRITICAL: .detach() the fake_sketch so D gradients don't flow to G
-        d_fake = discriminator(photo, fake_sketch.detach())
-        d_fake_loss = BCE(d_fake, fake_label)
-
-        # Total discriminator loss
-        d_loss = (d_real_loss + d_fake_loss) / 2
-
-        # Backprop on discriminator ONLY
-        d_optimizer.zero_grad()
+        # ── Step 1: Update Discriminator ──
+        with torch.no_grad():
+            fake_sketch = gen(photo)
+        d_real = disc(photo, real_sketch)
+        d_fake = disc(photo, fake_sketch)
+        d_loss = (bce(d_real, real_label.expand_as(d_real)) +
+                  bce(d_fake, fake_label.expand_as(d_fake))) * 0.5
+        d_opt.zero_grad()
         d_loss.backward()
-        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0)
-        d_optimizer.step()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(disc.parameters(), grad_clip)
+        d_opt.step()
 
-        # ═══════════════════════════════════════════════════
-        # STEP 2: UPDATE GENERATOR
-        # ═══════════════════════════════════════════════════
-        #
-        # The generator learns to produce sketches that:
-        #   a) LOOK like real sketches (fool the discriminator)
-        #   b) ARE close to the ground truth (L1 reconstruction)
-
-        # Generate again (without .detach() — we WANT gradients this time)
-        fake_sketch = generator(photo)
-
-        # Adversarial loss: "did I fool the discriminator?"
-        d_fake_for_g = discriminator(photo, fake_sketch)
-        g_adv_loss = BCE(d_fake_for_g, real_label)  # target=1.0: "be real!"
-
-        # L1 reconstruction loss: "am I structurally correct?"
-        g_l1_loss = L1Loss(fake_sketch, real_sketch)
-
-        # Total generator loss
-        g_loss = g_adv_loss * lambda_adv + g_l1_loss * lambda_l1
-
-        # Backprop on generator ONLY
-        g_optimizer.zero_grad()
+        # ── Step 2: Update Generator ──
+        fake_sketch = gen(photo)
+        d_fake_g = disc(photo, fake_sketch)
+        g_adv = bce(d_fake_g, real_label.expand_as(d_fake_g))
+        g_l1 = l1(fake_sketch, real_sketch)
+        g_loss = g_adv * lambda_adv + g_l1 * lambda_l1
+        g_opt.zero_grad()
         g_loss.backward()
-        torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
-        g_optimizer.step()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(gen.parameters(), grad_clip)
+        g_opt.step()
 
-        # ═══════════════════════════════════════════════════
-        # LOGGING
-        # ═══════════════════════════════════════════════════
-        if batch_idx % log_interval == 0:
-            print(f"Epoch {epoch} [{batch_idx}/{len(dataloader)}] "
-                  f"D_loss: {d_loss:.4f}  "
-                  f"G_adv: {g_adv_loss:.4f}  G_L1: {g_l1_loss:.4f}  "
-                  f"D_real: {d_real.mean():.3f}  D_fake: {d_fake.mean():.3f}")
+        # Track
+        m["d_loss"] += d_loss.item()
+        m["g_adv"] += g_adv.item()
+        m["g_l1"] += g_l1.item()
+        m["d_real"] += d_real.mean().item()
+        m["d_fake"] += d_fake.mean().item()
 
+        if batch_idx % cfg["log_interval"] == 0:
+            pbar.set_postfix({
+                "D": f"{d_loss.item():.3f}", "G_adv": f"{g_adv.item():.3f}",
+                "G_L1": f"{g_l1.item():.3f}", "Dr": f"{d_real.mean():.2f}",
+                "Df": f"{d_fake.mean():.2f}",
+            })
 
-def main():
-    1. Parse config (YAML or argparse)
-    2. Create dataloaders (train/val/test) from data_loader.py
-    3. Create Generator (UNetGenerator)
-    4. Create Discriminator (PatchGANDiscriminator)
-    5. Create optimizers (Adam, β1=0.5, β2=0.999, lr=2e-4)
-    6. Create loss functions (BCEWithLogitsLoss or MSELoss + L1Loss)
-    7. Training loop:
-       for epoch in range(num_epochs):
-           train_one_epoch(...)
-           if epoch % sample_interval == 0:
-               generate_val_samples(generator, val_loader)
-               save_sample_grid(epoch)
-           if epoch % save_interval == 0:
-               save_checkpoint(generator, discriminator, optimizers, epoch)
-    8. Save final checkpoint
+    for k in m: m[k] /= n
+    return m
 
 
-# ═══════════════════════════════════════════════════════════════
-# KEY DIFFERENCES FROM CLASSIFIER TRAINING
-# ═══════════════════════════════════════════════════════════════
-#
-# 1. TWO optimizers, updated SEPARATELY
-#    G and D are adversaries — they should NEVER share gradients.
-#    Always: zero_grad → compute_D_loss → backward → step(D)
-#            zero_grad → compute_G_loss → backward → step(G)
-#
-# 2. .detach() is critical
-#    When computing D_loss: fake_sketch = generator(photo).detach()
-#    When computing G_loss: fake_sketch = generator(photo)  ← no detach!
-#    Getting this wrong silently corrupts training.
-#
-# 3. Discriminator accuracy tells you if training is balanced
-#    D_real → 1.0: D correctly identifies real pairs
-#    D_fake → 0.0: D correctly identifies fake pairs
-#    Ideal: D_real ≈ 0.7-0.9, D_fake ≈ 0.3-0.5 (D slightly better than random)
-#    If D_real → 1.0 AND D_fake → 0.0: D is too strong, G can't learn
-#    If D_real ≈ D_fake ≈ 0.5: D is too weak, G isn't being challenged
-#
-# 4. No val loss in the traditional sense
-#    GANs don't have a clean "validation loss" that always correlates
-#    with quality. Monitor:
-#      - D accuracy balance (real vs fake predictions)
-#      - G_L1 on val set (should decrease)
-#      - VISUAL QUALITY of generated samples (MOST IMPORTANT)
-#
-# 5. β1=0.5 instead of 0.9
-#    Standard Adam uses β1=0.9 (heavy momentum). GANs train in a dynamic
-#    equilibrium — lower momentum (0.5) helps both networks adapt faster
-#    to each other's changes.
+@torch.no_grad()
+def evaluate(gen, loader, device, n_batches=5):
+    gen.eval()
+    total = 0.0; cnt = 0
+    l1 = nn.L1Loss()
+    for photo, real_sketch in loader:
+        if cnt >= n_batches: break
+        photo = photo.to(device); real_sketch = real_sketch.to(device)
+        fake = gen(photo)
+        total += l1(fake, real_sketch).item()
+        cnt += 1
+    gen.train()
+    return total / cnt if cnt > 0 else float("inf")
 
 
 # ═══════════════════════════════════════════════════════════════
-# COMMON PITFALLS (read before implementing)
+#  MAIN TRAINING
 # ═══════════════════════════════════════════════════════════════
-#
-# 1. FORGETTING .detach()
-#    Symptom: G_loss goes down but D_loss never changes
-#    Cause: Fake sketch gradients flowing to G through D_loss path
-#    Fix: Always .detach() fake_sketch when computing D_loss
-#
-# 2. MODE COLLAPSE
-#    Symptom: Generator produces same/similar output for any input
-#    Cause: G found a "safe" output that fools D consistently
-#    Fix: Increase λ_l1 (more ground truth signal), add noise to D inputs,
-#         use a buffer of generated images for D training
-#
-# 3. D OVERPOWERING G
-#    Symptom: D_loss → 0, G_loss stagnant or increasing
-#    Cause: D is too strong, G gets zero gradient through adversarial loss
-#    Fix: Decrease D learning rate, add label smoothing, reduce D capacity
-#
-# 4. CHECKERBOARD ARTIFACTS
-#    Symptom: Grid-like patterns in generated images
-#    Cause: ConvTranspose2d overlapping kernels
-#    Fix: Use Upsample + Conv2d instead of ConvTranspose2d
-#
-# 5. NAN LOSSES
-#    Symptom: Loss becomes NaN
-#    Cause: Gradients exploding, or log(0) in BCE with logits
-#    Fix: Gradient clipping (1.0), use BCEWithLogitsLoss (numerically stable),
-#         lower learning rate
-#
-# 6. G_L1 DOMINATES G_ADV
-#    Symptom: Outputs are blurry, G_adv loss doesn't change
-#    Cause: λ_l1 too high relative to λ_adv
-#    Fix: Decrease λ_l1 from 100 to 50 or 20
+
+def train(config_path=None, resume_from=None, overfit_batch=False):
+    cfg = CONFIG.copy()
+    mode = cfg["mode"]
+    S = cfg[mode]
+
+    # Override with mode-specific settings
+    for k in ["max_epochs", "batch_size", "image_size", "ngf", "num_levels",
+              "ndf", "sample_interval", "save_interval", "num_val_samples",
+              "log_interval"]:
+        if k in S:
+            cfg[k] = S[k]
+
+    # Load YAML config (overrides defaults)
+    if config_path:
+        with open(config_path, 'r') as f:
+            yaml_cfg = yaml.safe_load(f)
+        if yaml_cfg.get("training"):
+            t = yaml_cfg["training"]
+            for k in ["num_epochs", "batch_size", "learning_rate",
+                       "lambda_l1", "lambda_adv", "grad_clip",
+                       "label_smoothing_real", "label_smoothing_fake"]:
+                if k in t: cfg[k.replace("num_epochs", "max_epochs")] = t[k]
+            if "adam_beta1" in t: cfg["adam_beta1"] = t["adam_beta1"]
+            if "adam_beta2" in t: cfg["adam_beta2"] = t["adam_beta2"]
+            for k in ["save_interval", "sample_interval", "num_val_samples",
+                       "log_interval"]:
+                if k in t: cfg[k] = t[k]
+        if yaml_cfg.get("model"):
+            m = yaml_cfg["model"]
+            for k in ["image_size", "in_channels", "out_channels"]:
+                if k in m: cfg[k] = m[k]
+            if m.get("generator"):
+                for k in ["ngf", "num_levels", "use_dropout", "dropout"]:
+                    if k in m["generator"]: cfg[k] = m["generator"][k]
+            if m.get("discriminator"):
+                for k in ["ndf", "n_layers"]:
+                    if k in m["discriminator"]: cfg[k] = m["discriminator"][k]
+        if yaml_cfg.get("data"):
+            d = yaml_cfg["data"]
+            for k in ["data_dir", "val_fraction", "test_fraction", "num_workers",
+                       "mean", "std"]:
+                if k in d: cfg[k] = d[k]
+
+    device = torch.device(cfg["device"])
+    max_epochs = cfg["max_epochs"]
+
+    # ── Banner ──
+    is_resume = resume_from is not None
+    tag = "RESUME" if is_resume else mode.upper()
+    print(f"\n{'='*60}")
+    print(f"🎨  face2sketch — pix2pix GAN — {tag}")
+    print(f"{'='*60}")
+    print(f"   Device: {device}  |  Image: {cfg['image_size']}×{cfg['image_size']}")
+    print(f"   Epochs: {max_epochs}  |  Batch: {cfg['batch_size']}  |  "
+          f"LR: {cfg['learning_rate']}")
+    print(f"   Gen: ngf={cfg['ngf']} levels={cfg['num_levels']}  |  "
+          f"Disc: ndf={cfg['ndf']} layers={cfg['n_layers']}")
+    print(f"   λ_L1={cfg['lambda_l1']}  λ_adv={cfg['lambda_adv']}  |  "
+          f"β1={cfg['adam_beta1']}")
+
+    # ── Data ──
+    print(f"\n📦  Data: {cfg['data_dir']}")
+    dataset = FaceDataset(root_dir=cfg['data_dir'])
+    print(f"    Pairs: {len(dataset):,}")
+
+    main_tf, aug_tf = get_transformations(
+        cfg["mean"], cfg["std"],
+        size=(cfg["image_size"], cfg["image_size"]),
+    )
+    train_loader, val_loader, test_loader = get_dataloaders(
+        batch_size=cfg["batch_size"],
+        val_fraction=cfg["val_fraction"],
+        test_fraction=cfg["test_fraction"],
+        dataset=dataset,
+        main_transform=main_tf,
+        augmentation_transform=aug_tf,
+        num_workers=cfg["num_workers"],
+        mean=cfg["mean"], std=cfg["std"],
+    )
+    print(f"    Train: {len(train_loader)} batches  "
+          f"Val: {len(val_loader)}  Test: {len(test_loader)}")
+
+    # ── Models ──
+    gen, disc = create_models(cfg, device)
+    n_g = sum(p.numel() for p in gen.parameters())
+    n_d = sum(p.numel() for p in disc.parameters())
+    print(f"\n🧱  Generator: {n_g:,} params")
+    print(f"    Discriminator: {n_d:,} params")
+
+    # ── Optimizers ──
+    g_opt = optim.Adam(gen.parameters(), lr=cfg["learning_rate"],
+                       betas=(cfg["adam_beta1"], cfg["adam_beta2"]))
+    d_opt = optim.Adam(disc.parameters(), lr=cfg["learning_rate"],
+                       betas=(cfg["adam_beta1"], cfg["adam_beta2"]))
+
+    # ── Resume ──
+    start_epoch = 0
+    if resume_from:
+        resume_path = Path(resume_from)
+        if not resume_path.exists():
+            resume_path = ROOT / resume_from
+        start_epoch = load_ckpt(str(resume_path), gen, disc, g_opt, d_opt, device)
+
+    # ── Overfit batch test ──
+    if overfit_batch:
+        print("\n🧪  OVERFIT-BATCH SANITY CHECK (200 steps)")
+        _overfit_batch(gen, disc, train_loader, g_opt, d_opt, cfg, device)
+        save_ckpt(gen, disc, g_opt, d_opt, 0, 0.0, cfg, "overfit_test.pt")
+        print("   ✅  Overfit test saved: checkpoints/overfit_test.pt")
+        return
+
+    # ── Training ──
+    print(f"\n{'='*60}\n🚀  TRAINING START\n{'='*60}\n")
+    best_val_l1 = float("inf")
+    t0 = time.time()
+
+    for epoch in range(start_epoch + 1, max_epochs + 1):
+        metrics = train_one_epoch(gen, disc, train_loader, g_opt, d_opt, cfg,
+                                   epoch, device)
+
+        # ── Progress ──
+        elapsed = time.time() - t0
+        eta = elapsed / (epoch - start_epoch) * (max_epochs - epoch) if epoch > start_epoch else 0
+        print(f"Epoch {epoch:3d}/{max_epochs}  |  "
+              f"D={metrics['d_loss']:.4f}  G_adv={metrics['g_adv']:.4f}  "
+              f"G_L1={metrics['g_l1']:.4f}  "
+              f"Dr={metrics['d_real']:.3f}  Df={metrics['d_fake']:.3f}  "
+              f"⏱ {elapsed:.0f}s  ETA:{eta:.0f}s")
+
+        # ── Validation ──
+        val_l1 = evaluate(gen, val_loader, device)
+        is_best = val_l1 < best_val_l1
+        trend = "📉" if is_best else "➡️"
+        best_val_l1 = min(best_val_l1, val_l1)
+        print(f"        Val L1: {val_l1:.4f} {trend}  Best: {best_val_l1:.4f}")
+
+        # ── Samples ──
+        if epoch % cfg["sample_interval"] == 0 or epoch == 1:
+            gen.eval()
+            save_sample_grid(gen, val_loader, epoch, cfg["sample_dir"],
+                             device=device, num_samples=cfg["num_val_samples"])
+
+        # ── Checkpoints ──
+        if is_best:
+            p = save_ckpt(gen, disc, g_opt, d_opt, epoch, val_l1, cfg, "best.pt")
+            print(f"        🏆  Best! → {p.name}")
+
+        if epoch % cfg["save_interval"] == 0:
+            p = save_ckpt(gen, disc, g_opt, d_opt, epoch, val_l1, cfg,
+                           f"epoch_{epoch:03d}.pt")
+            print(f"        💾  {p.name}")
+
+        if epoch == max_epochs:
+            p = save_ckpt(gen, disc, g_opt, d_opt, epoch, val_l1, cfg, "final.pt")
+            print(f"        💾  {p.name}")
+
+    total_t = time.time() - t0
+    print(f"\n{'='*60}")
+    print(f"✅  Training complete!  {total_t:.0f}s  |  Best Val L1: {best_val_l1:.4f}")
+    print(f"{'='*60}")
+
+
+def _overfit_batch(gen, disc, loader, g_opt, d_opt, cfg, device):
+    """Overfit on one batch to verify pipeline."""
+    bce = nn.BCELoss()
+    l1 = nn.L1Loss()
+    real_lbl = torch.tensor([cfg["label_smoothing_real"]], device=device)
+    fake_lbl = torch.tensor([cfg["label_smoothing_fake"]], device=device)
+    la, ll, gc = cfg["lambda_adv"], cfg["lambda_l1"], cfg["grad_clip"]
+
+    photo, real_sketch = next(iter(loader))
+    photo = photo.to(device); real_sketch = real_sketch.to(device)
+    print(f"    Batch: {photo.shape}, {real_sketch.shape}")
+
+    for step in range(200):
+        # D
+        with torch.no_grad():
+            fake = gen(photo)
+        d_loss = (bce(disc(photo, real_sketch), real_lbl.expand_as(disc(photo, real_sketch))) +
+                  bce(disc(photo, fake), fake_lbl.expand_as(disc(photo, fake)))) * 0.5
+        d_opt.zero_grad(); d_loss.backward()
+        if gc > 0: torch.nn.utils.clip_grad_norm_(disc.parameters(), gc)
+        d_opt.step()
+
+        # G
+        fake = gen(photo)
+        g_adv = bce(disc(photo, fake), real_lbl.expand_as(disc(photo, fake)))
+        g_l1 = l1(fake, real_sketch)
+        g_loss = g_adv * la + g_l1 * ll
+        g_opt.zero_grad(); g_loss.backward()
+        if gc > 0: torch.nn.utils.clip_grad_norm_(gen.parameters(), gc)
+        g_opt.step()
+
+        if step % 40 == 0:
+            print(f"    Step {step:3d}: D={d_loss:.4f} G_adv={g_adv:.4f} "
+                  f"G_L1={g_l1:.4f} Dr={disc(photo, real_sketch).mean():.3f} "
+                  f"Df={disc(photo, fake.detach()).mean():.3f}")
+
+    print("    ✅  Overfit test passed!")
 
 
 # ═══════════════════════════════════════════════════════════════
-# OVERFIT-BATCH SANITY CHECK
+#  MAIN
 # ═══════════════════════════════════════════════════════════════
-#
-# Before full training, ALWAYS overfit on a single batch:
-#   python src/train.py --overfit-batch
-#
-# This catches 90% of bugs:
-#   - Model should memorize the batch (loss → 0, outputs match targets)
-#   - D accuracy should converge to ~50% (can't distinguish on 1 batch)
-#   - If it can't overfit, something is broken (architecture, loss, data)
-#
-# Same pattern as overfitting on a single text sequence
-# when debugging a language model.
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description="Train pix2pix GAN (Phase 1)")
+    p.add_argument("--mode", choices=["test", "train"], default="train",
+                   help="test = small local run | train = full training")
+    p.add_argument("--config", type=str, default=None,
+                   help="YAML config file (overrides defaults)")
+    p.add_argument("--resume", type=str, default=None,
+                   help="Resume from checkpoint")
+    p.add_argument("--overfit-batch", action="store_true",
+                   help="Overfit a single batch (sanity check)")
+    p.add_argument("--device", type=str, default=None,
+                   help="Device: cuda, mps, or cpu")
+    p.add_argument("--name", type=str, default="",
+                   help="Prefix for checkpoint files (e.g. phase1_)")
+    args = p.parse_args()
+
+    if args.mode:
+        CONFIG["mode"] = args.mode
+    if args.device:
+        CONFIG["device"] = args.device
+    if args.name:
+        CONFIG["ckpt_prefix"] = args.name
+
+    train(config_path=args.config, resume_from=args.resume,
+          overfit_batch=args.overfit_batch)

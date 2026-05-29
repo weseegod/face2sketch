@@ -9,10 +9,12 @@ venv/
 
 # Training artifacts
 checkpoints/
+samples/
 outputs/
 
-# Data
+# Data files (generated locally, zipped, uploaded to Drive for Colab)
 data/
+data.zip
 
 # System
 .DS_Store
