@@ -74,10 +74,10 @@ training:
 data:
   # Dataset root directory for Phase 1
   data_dir: "data/dataset"
-  # Validation split fraction (from the 322 pairs)
-  val_fraction: 0.1
-  # Test split fraction
-  test_fraction: 0.05
+  # Validation split fraction (0 = use 100% for training)
+  val_fraction: 0.0
+  # Test split fraction (0 = no test set)
+  test_fraction: 0.0
   # Number of dataloader workers
   num_workers: 2
   # Use data augmentation (random flip, rotation)

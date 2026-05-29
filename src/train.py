@@ -52,8 +52,8 @@ CONFIG = {
 
     # Data
     "data_dir": "data/dataset",
-    "val_fraction": 0.1,
-    "test_fraction": 0.05,
+    "val_fraction": 0.0,
+    "test_fraction": 0.0,
     "num_workers": 2,
     "mean": DATASET_MEAN,
     "std": DATASET_STD,
@@ -308,8 +308,12 @@ def train(config_path=None, resume_from=None, overfit_batch=False):
         num_workers=cfg["num_workers"],
         mean=cfg["mean"], std=cfg["std"],
     )
+    # Use val_loader for samples if available, otherwise use train_loader
+    sample_loader = val_loader if len(val_loader) > 0 else train_loader
     print(f"    Train: {len(train_loader)} batches  "
           f"Val: {len(val_loader)}  Test: {len(test_loader)}")
+    if len(val_loader) == 0:
+        print(f"    ⚠️   No val split — using 100% data for training")
 
     # ── Models ──
     gen, disc = create_models(cfg, device)
@@ -358,17 +362,22 @@ def train(config_path=None, resume_from=None, overfit_batch=False):
               f"Dr={metrics['d_real']:.3f}  Df={metrics['d_fake']:.3f}  "
               f"⏱ {elapsed:.0f}s  ETA:{eta:.0f}s")
 
-        # ── Validation ──
-        val_l1 = evaluate(gen, val_loader, device)
-        is_best = val_l1 < best_val_l1
-        trend = "📉" if is_best else "➡️"
-        best_val_l1 = min(best_val_l1, val_l1)
-        print(f"        Val L1: {val_l1:.4f} {trend}  Best: {best_val_l1:.4f}")
+        # ── Validation (skip if no val set) ──
+        if len(val_loader) > 0:
+            val_l1 = evaluate(gen, val_loader, device)
+            is_best = val_l1 < best_val_l1
+            trend = "📉" if is_best else "➡️"
+            best_val_l1 = min(best_val_l1, val_l1)
+            print(f"        Val L1: {val_l1:.4f} {trend}  Best: {best_val_l1:.4f}")
+        else:
+            val_l1 = metrics["g_l1"]
+            is_best = val_l1 < best_val_l1
+            best_val_l1 = min(best_val_l1, val_l1)
 
         # ── Samples ──
         if epoch % cfg["sample_interval"] == 0 or epoch == 1:
             gen.eval()
-            save_sample_grid(gen, val_loader, epoch, cfg["sample_dir"],
+            save_sample_grid(gen, sample_loader, epoch, cfg["sample_dir"],
                              device=device, num_samples=cfg["num_val_samples"])
 
         # ── Checkpoints ──
@@ -387,7 +396,8 @@ def train(config_path=None, resume_from=None, overfit_batch=False):
 
     total_t = time.time() - t0
     print(f"\n{'='*60}")
-    print(f"✅  Training complete!  {total_t:.0f}s  |  Best Val L1: {best_val_l1:.4f}")
+    label = "Val L1" if len(val_loader) > 0 else "Train L1"
+    print(f"✅  Training complete!  {total_t:.0f}s  |  Best {label}: {best_val_l1:.4f}")
     print(f"{'='*60}")
 
 
