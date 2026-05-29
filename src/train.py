@@ -64,12 +64,14 @@ CONFIG = {
         "ngf": 32, "num_levels": 4, "ndf": 32,
         "sample_interval": 1, "save_interval": 5,
         "num_val_samples": 4, "log_interval": 10,
+        "patience": 0,
     },
     "train": {
         "max_epochs": 200, "batch_size": 16, "image_size": 256,
         "ngf": 64, "num_levels": 5, "ndf": 64,
         "sample_interval": 10, "save_interval": 20,
         "num_val_samples": 8, "log_interval": 50,
+        "patience": 10,
     },
 
     # Optimizer
@@ -345,8 +347,10 @@ def train(config_path=None, resume_from=None, overfit_batch=False):
         return
 
     # ── Training ──
-    print(f"\n{'='*60}\n🚀  TRAINING START\n{'='*60}\n")
+    patience = cfg.get("patience", 0)
+    print(f"\n{'='*60}\n🚀  TRAINING START  (patience={patience})\n{'='*60}\n")
     best_val_l1 = float("inf")
+    plateau_count = 0
     t0 = time.time()
 
     for epoch in range(start_epoch + 1, max_epochs + 1):
@@ -374,6 +378,12 @@ def train(config_path=None, resume_from=None, overfit_batch=False):
             is_best = val_l1 < best_val_l1
             best_val_l1 = min(best_val_l1, val_l1)
 
+        # ── Plateau tracking (early stopping) ──
+        if is_best:
+            plateau_count = 0
+        else:
+            plateau_count += 1
+
         # ── Samples ──
         if epoch % cfg["sample_interval"] == 0 or epoch == 1:
             gen.eval()
@@ -393,6 +403,13 @@ def train(config_path=None, resume_from=None, overfit_batch=False):
         if epoch == max_epochs:
             p = save_ckpt(gen, disc, g_opt, d_opt, epoch, val_l1, cfg, "final.pt")
             print(f"        💾  {p.name}")
+
+        # ── Early stop ──
+        if patience > 0 and plateau_count >= patience:
+            print(f"        ⏹️  No improvement for {patience} epochs — stopping early")
+            p = save_ckpt(gen, disc, g_opt, d_opt, epoch, val_l1, cfg, "early_stop.pt")
+            print(f"        💾  {p.name}")
+            break
 
     total_t = time.time() - t0
     print(f"\n{'='*60}")
