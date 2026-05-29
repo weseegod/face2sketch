@@ -74,8 +74,9 @@ CONFIG = {
         "patience": 10,
     },
 
-    # Optimizer
-    "learning_rate": 2e-4, "adam_beta1": 0.5, "adam_beta2": 0.999,
+    # Optimizer (D gets lower LR to prevent overpowering G)
+    "g_lr": 2e-4, "d_lr": 1e-4,
+    "adam_beta1": 0.5, "adam_beta2": 0.999,
 
     # Loss
     "lambda_l1": 100, "lambda_adv": 1.0,
@@ -253,6 +254,13 @@ def train(config_path=None, resume_from=None, overfit_batch=False):
                        "lambda_l1", "lambda_adv", "grad_clip",
                        "label_smoothing_real", "label_smoothing_fake"]:
                 if k in t: cfg[k.replace("num_epochs", "max_epochs")] = t[k]
+            # Separate G/D learning rates (D lower = prevents overpowering)
+            if "g_lr" in t: cfg["g_lr"] = t["g_lr"]
+            if "d_lr" in t: cfg["d_lr"] = t["d_lr"]
+            elif "learning_rate" in t:
+                # Backward compat: if only learning_rate, D gets half
+                cfg["d_lr"] = t["learning_rate"] / 2
+                cfg["g_lr"] = t["learning_rate"]
             if "adam_beta1" in t: cfg["adam_beta1"] = t["adam_beta1"]
             if "adam_beta2" in t: cfg["adam_beta2"] = t["adam_beta2"]
             for k in ["save_interval", "sample_interval", "num_val_samples",
@@ -285,7 +293,7 @@ def train(config_path=None, resume_from=None, overfit_batch=False):
     print(f"{'='*60}")
     print(f"   Device: {device}  |  Image: {cfg['image_size']}×{cfg['image_size']}")
     print(f"   Epochs: {max_epochs}  |  Batch: {cfg['batch_size']}  |  "
-          f"LR: {cfg['learning_rate']}")
+          f"G_lr: {cfg['g_lr']}  D_lr: {cfg['d_lr']}")
     print(f"   Gen: ngf={cfg['ngf']} levels={cfg['num_levels']}  |  "
           f"Disc: ndf={cfg['ndf']} layers={cfg['n_layers']}")
     print(f"   λ_L1={cfg['lambda_l1']}  λ_adv={cfg['lambda_adv']}  |  "
@@ -325,9 +333,9 @@ def train(config_path=None, resume_from=None, overfit_batch=False):
     print(f"    Discriminator: {n_d:,} params")
 
     # ── Optimizers ──
-    g_opt = optim.Adam(gen.parameters(), lr=cfg["learning_rate"],
+    g_opt = optim.Adam(gen.parameters(), lr=cfg["g_lr"],
                        betas=(cfg["adam_beta1"], cfg["adam_beta2"]))
-    d_opt = optim.Adam(disc.parameters(), lr=cfg["learning_rate"],
+    d_opt = optim.Adam(disc.parameters(), lr=cfg["d_lr"],
                        betas=(cfg["adam_beta1"], cfg["adam_beta2"]))
 
     # ── Resume ──
