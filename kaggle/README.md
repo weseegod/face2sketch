@@ -6,53 +6,37 @@
 
 ```bash
 cd /Users/thanhbm/Projects/face2sketch
-rm -rf kaggle_dataset && mkdir -p kaggle_dataset
-cp data.zip kaggle_dataset/
+rm -rf kaggle_dataset && mkdir kaggle_dataset
+
+# Copy raw data folders (no zip needed)
+cp -a data/dataset   kaggle_dataset/
+cp -a data/finetune  kaggle_dataset/
+cp -a data/test      kaggle_dataset/
+
+# Copy Phase 1 checkpoint
 cp checkpoints/pix2pix_best.pt kaggle_dataset/
 ```
 
 You now have:
 ```
 kaggle_dataset/
-├── data.zip            (287MB)
-└── pix2pix_best.pt     (454MB)
+├── dataset/              (photos/ + sketches/ — 322 pairs)
+├── finetune/             (photos/ + sketches/ — 184 pairs)
+├── test/                 (photos/ + sketches/ — 100 pairs)
+└── pix2pix_best.pt       (454MB — Phase 1 checkpoint)
 ```
 
-### Step 2: Upload to Kaggle
+### Step 2: Upload
 
 1. Go to https://www.kaggle.com/datasets → **New Dataset**
 2. Title: `face2sketch`
-3. **Drag the `kaggle_dataset/` folder** (not the files inside, the whole folder)
+3. Drag the **`kaggle_dataset/` folder** (the whole thing)
 4. Visibility: Private
 5. Click **Create**
-
-⚠️  **Drag the FOLDER, not the files.** If you drag files individually, Kaggle won't nest them and the notebook's recursive search will still find them — but the folder upload is cleaner.
 
 ### Step 3: Add to notebook
 
 1. Open `kaggle/kaggle_finetune.ipynb` on Kaggle
 2. Right sidebar → **Input** → **Add Input** → search `face2sketch`
-3. Enable **GPU** (Accelerator) + **Internet**
+3. Enable **GPU** + **Internet**
 4. Run cells 1→5
-
----
-
-## How the data flows
-
-```
-kaggle_dataset/              ──upload──►  Kaggle Dataset "face2sketch"
-  data.zip                                 │
-  pix2pix_best.pt                          ▼
-                                    /kaggle/input/.../data.zip
-                                    /kaggle/input/.../pix2pix_best.pt
-                                           │
-                                    cell 2: find + unzip + copy
-                                           ▼
-                                    /kaggle/working/face2sketch/
-                                      data/dataset/   (322 pairs)
-                                      data/finetune/  (184 pairs)  ← Phase 2
-                                      data/test/      (100 pairs)
-                                      checkpoints/pix2pix_best.pt
-```
-
-Cell 2 recursively searches all of `/kaggle/input/` so it works regardless of how Kaggle nests your dataset folder.
