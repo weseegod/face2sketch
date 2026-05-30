@@ -116,6 +116,51 @@ def create_models(cfg, device):
     return gen, disc
 
 
+def auto_batch_size(gen, disc, device, image_size=256, start=48, min_batch=4):
+    """Probe VRAM to find the largest batch size that fits.
+    Runs a dummy forward+backward and catches OOM, stepping down."""
+    if device.type != 'cuda':
+        return 16  # CPU — stick with default
+
+    total_mb = torch.cuda.get_device_properties(device).total_memory / 1024**2
+    print(f"    💾  VRAM: {total_mb:.0f}MB — probing batch size...")
+
+    gen.train(); disc.train()
+    bce = nn.BCELoss(); l1 = nn.L1Loss()
+    bs = start
+
+    while bs >= min_batch:
+        try:
+            photo = torch.randn(bs, 3, image_size, image_size, device=device)
+            sketch = torch.randn(bs, 3, image_size, image_size, device=device)
+            rl = torch.ones(bs, 1, 30, 30, device=device) * 0.9
+            fl = torch.zeros(bs, 1, 30, 30, device=device)
+
+            # Full G+D forward + backward (same as real training)
+            with torch.no_grad():
+                fake = gen(photo)
+            d_loss = (bce(disc(photo, sketch), rl) + bce(disc(photo, fake), fl)) * 0.5
+            d_loss.backward()
+
+            fake2 = gen(photo)
+            g_loss = bce(disc(photo, fake2), rl) + l1(fake2, sketch) * 100
+            g_loss.backward()
+
+            torch.cuda.empty_cache()
+            gen.zero_grad(); disc.zero_grad()
+            print(f"    ✅  batch_size={bs} fits")
+            return bs
+        except RuntimeError as e:
+            if 'out of memory' in str(e):
+                torch.cuda.empty_cache()
+                bs //= 2
+            else:
+                raise
+
+    print(f"    ⚠️  Even batch={min_batch} OOM. Falling back to {min_batch}")
+    return min_batch
+
+
 # ═══════════════════════════════════════════════════════════════
 #  CHECKPOINT
 # ═══════════════════════════════════════════════════════════════
@@ -340,8 +385,9 @@ def train(config_path=None, resume_from=None, finetune_from=None,
           f"β1={cfg['adam_beta1']}")
 
     # ── CLI overrides (batch-size, lr) ──
-    if cfg.get("batch_size_override"):
-        cfg["batch_size"] = cfg["batch_size_override"]
+    user_batch = cfg.get("batch_size_override", None)
+    if user_batch:
+        cfg["batch_size"] = user_batch
         print(f"    📦  Batch size override: {cfg['batch_size']}")
     if cfg.get("lr_override"):
         cfg["g_lr"] = cfg["lr_override"]
@@ -385,6 +431,15 @@ def train(config_path=None, resume_from=None, finetune_from=None,
     n_d = sum(p.numel() for p in disc.parameters())
     print(f"\n🧱  Generator: {n_g:,} params")
     print(f"    Discriminator: {n_d:,} params")
+
+    # ── Auto batch size (CUDA only, unless user overrode) ──
+    if not user_batch and device.type == 'cuda':
+        cfg["batch_size"] = auto_batch_size(
+            gen, disc, device,
+            image_size=cfg["image_size"],
+            start=cfg.get("batch_size", 16) * 2,
+        )
+        print(f"    📦  Auto batch: {cfg['batch_size']} (probed from VRAM)")
 
     # ── Optimizers ──
     g_opt = optim.Adam(gen.parameters(), lr=cfg["g_lr"],
