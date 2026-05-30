@@ -25,3 +25,4 @@ wandb/
 resources/
 data_phase1.zip
 finetune_data.zip
+kaggle_dataset/

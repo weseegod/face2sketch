@@ -339,6 +339,15 @@ def train(config_path=None, resume_from=None, finetune_from=None,
     print(f"   λ_L1={cfg['lambda_l1']}  λ_adv={cfg['lambda_adv']}  |  "
           f"β1={cfg['adam_beta1']}")
 
+    # ── CLI overrides (batch-size, lr) ──
+    if cfg.get("batch_size_override"):
+        cfg["batch_size"] = cfg["batch_size_override"]
+        print(f"    📦  Batch size override: {cfg['batch_size']}")
+    if cfg.get("lr_override"):
+        cfg["g_lr"] = cfg["lr_override"]
+        cfg["d_lr"] = cfg["lr_override"] / 2
+        print(f"    ⚡  LR override: G={cfg['g_lr']}, D={cfg['d_lr']}")
+
     # ── Data ──
     print(f"\n📦  Data: {cfg['data_dir']}")
     dataset = FaceDataset(root_dir=cfg['data_dir'])
@@ -548,6 +557,10 @@ if __name__ == "__main__":
                    help="Device: cuda, mps, or cpu")
     p.add_argument("--name", type=str, default="",
                    help="Prefix for checkpoint files")
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="Override batch size (Kaggle T4x2: use 32-48)")
+    p.add_argument("--lr", type=float, default=None,
+                   help="Override G learning rate")
     args = p.parse_args()
 
     if args.mode:
@@ -556,6 +569,10 @@ if __name__ == "__main__":
         CONFIG["device"] = args.device
     if args.name:
         CONFIG["ckpt_prefix"] = args.name
+    if args.batch_size:
+        CONFIG["batch_size_override"] = args.batch_size
+    if args.lr:
+        CONFIG["lr_override"] = args.lr
 
     train(config_path=args.config, resume_from=args.resume,
           finetune_from=args.finetune,
