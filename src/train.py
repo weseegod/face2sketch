@@ -88,6 +88,9 @@ CONFIG = {
     "label_smoothing_real": 0.9, "label_smoothing_fake": 0.0,
     "grad_clip": 1.0,
 
+    # Gradient accumulation (1 = no accumulation, 2+ = accumulate N steps)
+    "grad_accum": 1,
+
     # Paths
     "checkpoint_dir": "checkpoints",
     "sample_dir": "samples",
@@ -116,49 +119,14 @@ def create_models(cfg, device):
     return gen, disc
 
 
-def auto_batch_size(gen, disc, device, image_size=256, start=48, min_batch=4):
-    """Probe VRAM to find the largest batch size that fits.
-    Runs a dummy forward+backward and catches OOM, stepping down."""
-    if device.type != 'cuda':
-        return 16  # CPU — stick with default
-
-    total_mb = torch.cuda.get_device_properties(device).total_memory / 1024**2
-    print(f"    💾  VRAM: {total_mb:.0f}MB — probing batch size...")
-
-    gen.train(); disc.train()
-    bce = nn.BCELoss(); l1 = nn.L1Loss()
-    bs = start
-
-    while bs >= min_batch:
-        try:
-            photo = torch.randn(bs, 3, image_size, image_size, device=device)
-            sketch = torch.randn(bs, 3, image_size, image_size, device=device)
-            rl = torch.ones(bs, 1, 30, 30, device=device) * 0.9
-            fl = torch.zeros(bs, 1, 30, 30, device=device)
-
-            # Full G+D forward + backward (same as real training)
-            with torch.no_grad():
-                fake = gen(photo)
-            d_loss = (bce(disc(photo, sketch), rl) + bce(disc(photo, fake), fl)) * 0.5
-            d_loss.backward()
-
-            fake2 = gen(photo)
-            g_loss = bce(disc(photo, fake2), rl) + l1(fake2, sketch) * 100
-            g_loss.backward()
-
-            torch.cuda.empty_cache()
-            gen.zero_grad(); disc.zero_grad()
-            print(f"    ✅  batch_size={bs} fits")
-            return bs
-        except RuntimeError as e:
-            if 'out of memory' in str(e):
-                torch.cuda.empty_cache()
-                bs //= 2
-            else:
-                raise
-
-    print(f"    ⚠️  Even batch={min_batch} OOM. Falling back to {min_batch}")
-    return min_batch
+def wrap_models(gen, disc, device):
+    """Wrap in DataParallel if multiple GPUs available."""
+    if device.type == 'cuda' and torch.cuda.device_count() > 1:
+        n = torch.cuda.device_count()
+        gen = nn.DataParallel(gen)
+        disc = nn.DataParallel(disc)
+        print(f"    🖥️   DataParallel: {n} GPUs")
+    return gen, disc
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -214,7 +182,10 @@ def get_finetune_augmentation(mean, std, size=(256, 256)):
 # ═══════════════════════════════════════════════════════════════
 
 def train_one_epoch(gen, disc, dataloader, g_opt, d_opt, cfg, epoch, device,
-                     use_adversarial=True):
+                     use_adversarial=True, grad_accum=1):
+    """One training epoch with gradient accumulation.
+    grad_accum: number of batches to accumulate before optimizer step.
+      effective_batch = batch_size * grad_accum * num_gpus"""
     gen.train(); disc.train()
 
     bce = nn.BCELoss()
@@ -242,12 +213,13 @@ def train_one_epoch(gen, disc, dataloader, g_opt, d_opt, cfg, epoch, device,
             d_real = disc(photo, real_sketch)
             d_fake = disc(photo, fake_sketch)
             d_loss = (bce(d_real, real_label.expand_as(d_real)) +
-                      bce(d_fake, fake_label.expand_as(d_fake))) * 0.5
-            d_opt.zero_grad()
+                      bce(d_fake, fake_label.expand_as(d_fake))) * 0.5 / grad_accum
             d_loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(disc.parameters(), grad_clip)
-            d_opt.step()
+            if (batch_idx + 1) % grad_accum == 0:
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(disc.parameters(), grad_clip)
+                d_opt.step()
+                d_opt.zero_grad()
 
         # ── Step 2: Update Generator ──
         fake_sketch = gen(photo)
@@ -255,18 +227,19 @@ def train_one_epoch(gen, disc, dataloader, g_opt, d_opt, cfg, epoch, device,
         if use_adversarial:
             d_fake_g = disc(photo, fake_sketch)
             g_adv = bce(d_fake_g, real_label.expand_as(d_fake_g))
-            g_loss = g_adv * lambda_adv + g_l1 * lambda_l1
+            g_loss = (g_adv * lambda_adv + g_l1 * lambda_l1) / grad_accum
         else:
             g_adv = torch.tensor(0.0, device=device)
-            g_loss = g_l1 * lambda_l1
-        g_opt.zero_grad()
+            g_loss = (g_l1 * lambda_l1) / grad_accum
         g_loss.backward()
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(gen.parameters(), grad_clip)
-        g_opt.step()
+        if (batch_idx + 1) % grad_accum == 0:
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(gen.parameters(), grad_clip)
+            g_opt.step()
+            g_opt.zero_grad()
 
-        # Track
-        m["d_loss"] += d_loss.item() if use_adversarial else 0.0
+        # Track (un-scale for clean logging)
+        m["d_loss"] += d_loss.item() * grad_accum if use_adversarial else 0.0
         m["g_adv"] += g_adv.item() if use_adversarial else 0.0
         m["g_l1"] += g_l1.item()
         m["d_real"] += d_real.mean().item() if use_adversarial else 0.5
@@ -274,8 +247,10 @@ def train_one_epoch(gen, disc, dataloader, g_opt, d_opt, cfg, epoch, device,
 
         if batch_idx % cfg["log_interval"] == 0:
             pbar.set_postfix({
-                "D": f"{d_loss.item():.3f}", "G_adv": f"{g_adv.item():.3f}",
-                "G_L1": f"{g_l1.item():.3f}", "Dr": f"{d_real.mean():.2f}",
+                "D": f"{d_loss.item() * grad_accum:.3f}",
+                "G_adv": f"{g_adv.item():.3f}",
+                "G_L1": f"{g_l1.item():.3f}",
+                "Dr": f"{d_real.mean():.2f}",
                 "Df": f"{d_fake.mean():.2f}",
             })
 
@@ -385,9 +360,8 @@ def train(config_path=None, resume_from=None, finetune_from=None,
           f"β1={cfg['adam_beta1']}")
 
     # ── CLI overrides (batch-size, lr) ──
-    user_batch = cfg.get("batch_size_override", None)
-    if user_batch:
-        cfg["batch_size"] = user_batch
+    if cfg.get("batch_size_override"):
+        cfg["batch_size"] = cfg["batch_size_override"]
         print(f"    📦  Batch size override: {cfg['batch_size']}")
     if cfg.get("lr_override"):
         cfg["g_lr"] = cfg["lr_override"]
@@ -427,19 +401,16 @@ def train(config_path=None, resume_from=None, finetune_from=None,
 
     # ── Models ──
     gen, disc = create_models(cfg, device)
+    gen, disc = wrap_models(gen, disc, device)
     n_g = sum(p.numel() for p in gen.parameters())
     n_d = sum(p.numel() for p in disc.parameters())
+    n_gpu = torch.cuda.device_count() if device.type == 'cuda' else 1
+    grad_accum = cfg.get("grad_accum", 1)
+    eff_batch = cfg["batch_size"] * grad_accum * n_gpu
     print(f"\n🧱  Generator: {n_g:,} params")
     print(f"    Discriminator: {n_d:,} params")
-
-    # ── Auto batch size (CUDA only, unless user overrode) ──
-    if not user_batch and device.type == 'cuda':
-        cfg["batch_size"] = auto_batch_size(
-            gen, disc, device,
-            image_size=cfg["image_size"],
-            start=cfg.get("batch_size", 16) * 2,
-        )
-        print(f"    📦  Auto batch: {cfg['batch_size']} (probed from VRAM)")
+    print(f"    GPUs: {n_gpu}  |  Batch/GPU: {cfg['batch_size']}"
+          f"  |  Grad accum: {grad_accum}  |  Effective: {eff_batch}")
 
     # ── Optimizers ──
     g_opt = optim.Adam(gen.parameters(), lr=cfg["g_lr"],
@@ -489,7 +460,8 @@ def train(config_path=None, resume_from=None, finetune_from=None,
             print(f"    ⚔️   Warmup done — adversarial training ON")
 
         metrics = train_one_epoch(gen, disc, train_loader, g_opt, d_opt, cfg,
-                                   epoch, device, use_adversarial=use_adv)
+                                   epoch, device, use_adversarial=use_adv,
+                                   grad_accum=grad_accum)
 
         # ── Progress ──
         elapsed = time.time() - t0
