@@ -34,7 +34,7 @@ from sample import postprocess_tensor
 
 
 def load_checkpoint(ckpt_path, device):
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     state = ckpt.get("generator", ckpt)
 
     cfg = ckpt.get("config", {})
@@ -46,6 +46,11 @@ def load_checkpoint(ckpt_path, device):
         use_dropout=cfg.get("use_dropout", True),
         dropout=cfg.get("dropout", 0.5),
     ).to(device)
+
+    # Strip DataParallel 'module.' prefix if checkpoint was saved with it
+    if any(k.startswith('module.') for k in state.keys()):
+        state = {k[7:] if k.startswith('module.') else k: v for k, v in state.items()}
+
     gen.load_state_dict(state)
     gen.eval()
 
