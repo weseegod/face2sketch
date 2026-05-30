@@ -168,7 +168,8 @@ def get_finetune_augmentation(mean, std, size=(256, 256)):
 #  TRAINING LOOP
 # ═══════════════════════════════════════════════════════════════
 
-def train_one_epoch(gen, disc, dataloader, g_opt, d_opt, cfg, epoch, device):
+def train_one_epoch(gen, disc, dataloader, g_opt, d_opt, cfg, epoch, device,
+                     use_adversarial=True):
     gen.train(); disc.train()
 
     bce = nn.BCELoss()
@@ -187,25 +188,32 @@ def train_one_epoch(gen, disc, dataloader, g_opt, d_opt, cfg, epoch, device):
         photo = photo.to(device)
         real_sketch = real_sketch.to(device)
 
-        # ── Step 1: Update Discriminator ──
-        with torch.no_grad():
-            fake_sketch = gen(photo)
-        d_real = disc(photo, real_sketch)
-        d_fake = disc(photo, fake_sketch)
-        d_loss = (bce(d_real, real_label.expand_as(d_real)) +
-                  bce(d_fake, fake_label.expand_as(d_fake))) * 0.5
-        d_opt.zero_grad()
-        d_loss.backward()
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(disc.parameters(), grad_clip)
-        d_opt.step()
+        d_real = d_fake = d_loss = torch.tensor(0.0, device=device)
+
+        # ── Step 1: Update Discriminator (skip during L1 warmup) ──
+        if use_adversarial:
+            with torch.no_grad():
+                fake_sketch = gen(photo)
+            d_real = disc(photo, real_sketch)
+            d_fake = disc(photo, fake_sketch)
+            d_loss = (bce(d_real, real_label.expand_as(d_real)) +
+                      bce(d_fake, fake_label.expand_as(d_fake))) * 0.5
+            d_opt.zero_grad()
+            d_loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(disc.parameters(), grad_clip)
+            d_opt.step()
 
         # ── Step 2: Update Generator ──
         fake_sketch = gen(photo)
-        d_fake_g = disc(photo, fake_sketch)
-        g_adv = bce(d_fake_g, real_label.expand_as(d_fake_g))
         g_l1 = l1(fake_sketch, real_sketch)
-        g_loss = g_adv * lambda_adv + g_l1 * lambda_l1
+        if use_adversarial:
+            d_fake_g = disc(photo, fake_sketch)
+            g_adv = bce(d_fake_g, real_label.expand_as(d_fake_g))
+            g_loss = g_adv * lambda_adv + g_l1 * lambda_l1
+        else:
+            g_adv = torch.tensor(0.0, device=device)
+            g_loss = g_l1 * lambda_l1
         g_opt.zero_grad()
         g_loss.backward()
         if grad_clip > 0:
@@ -213,11 +221,11 @@ def train_one_epoch(gen, disc, dataloader, g_opt, d_opt, cfg, epoch, device):
         g_opt.step()
 
         # Track
-        m["d_loss"] += d_loss.item()
-        m["g_adv"] += g_adv.item()
+        m["d_loss"] += d_loss.item() if use_adversarial else 0.0
+        m["g_adv"] += g_adv.item() if use_adversarial else 0.0
         m["g_l1"] += g_l1.item()
-        m["d_real"] += d_real.mean().item()
-        m["d_fake"] += d_fake.mean().item()
+        m["d_real"] += d_real.mean().item() if use_adversarial else 0.5
+        m["d_fake"] += d_fake.mean().item() if use_adversarial else 0.5
 
         if batch_idx % cfg["log_interval"] == 0:
             pbar.set_postfix({
@@ -279,6 +287,7 @@ def train(config_path=None, resume_from=None, finetune_from=None,
                 # Backward compat: if only learning_rate, D gets half
                 cfg["d_lr"] = t["learning_rate"] / 2
                 cfg["g_lr"] = t["learning_rate"]
+            if "l1_warmup_epochs" in t: cfg["l1_warmup_epochs"] = t["l1_warmup_epochs"]
             if "adam_beta1" in t: cfg["adam_beta1"] = t["adam_beta1"]
             if "adam_beta2" in t: cfg["adam_beta2"] = t["adam_beta2"]
             for k in ["save_interval", "sample_interval", "num_val_samples",
@@ -306,10 +315,11 @@ def train(config_path=None, resume_from=None, finetune_from=None,
         cfg["data_dir"] = "data/finetune"
         cfg["mean"] = FINETUNE_MEAN
         cfg["std"] = FINETUNE_STD
-        cfg["g_lr"] = 5e-5
-        cfg["d_lr"] = 2.5e-5
-        cfg["lambda_l1"] = 50
-        cfg["val_fraction"] = 0.1
+        cfg.setdefault("g_lr", 5e-5)
+        cfg.setdefault("d_lr", 2.5e-5)
+        cfg.setdefault("lambda_l1", 50)
+        cfg.setdefault("val_fraction", 0.1)
+        cfg.setdefault("l1_warmup_epochs", 0)
         print("    🎯  FINETUNE mode: Phase 1 G → Phase 2 caricatures")
 
     device = torch.device(cfg["device"])
@@ -398,19 +408,30 @@ def train(config_path=None, resume_from=None, finetune_from=None,
 
     # ── Training ──
     patience = cfg.get("patience", 0)
-    print(f"\n{'='*60}\n🚀  TRAINING START  (patience={patience})\n{'='*60}\n")
+    l1_warmup = cfg.get("l1_warmup_epochs", 0)
+    print(f"\n{'='*60}\n🚀  TRAINING START  (patience={patience}" +
+          (f", L1 warmup={l1_warmup} epochs)" if l1_warmup > 0 else ")"))
+    print(f"{'='*60}\n")
     best_val_l1 = float("inf")
     plateau_count = 0
     t0 = time.time()
 
+    l1_warmup = cfg.get("l1_warmup_epochs", 0)
     for epoch in range(start_epoch + 1, max_epochs + 1):
+        use_adv = epoch > l1_warmup
+        if epoch == 1 and l1_warmup > 0:
+            print(f"    🔥  L1-only warmup: {l1_warmup} epochs (no adversarial)")
+        if epoch == l1_warmup + 1:
+            print(f"    ⚔️   Warmup done — adversarial training ON")
+
         metrics = train_one_epoch(gen, disc, train_loader, g_opt, d_opt, cfg,
-                                   epoch, device)
+                                   epoch, device, use_adversarial=use_adv)
 
         # ── Progress ──
         elapsed = time.time() - t0
         eta = elapsed / (epoch - start_epoch) * (max_epochs - epoch) if epoch > start_epoch else 0
-        print(f"Epoch {epoch:3d}/{max_epochs}  |  "
+        warmup_tag = "🔥" if not use_adv else ""
+        print(f"Epoch {epoch:3d}/{max_epochs} {warmup_tag} |  "
               f"D={metrics['d_loss']:.4f}  G_adv={metrics['g_adv']:.4f}  "
               f"G_L1={metrics['g_l1']:.4f}  "
               f"Dr={metrics['d_real']:.3f}  Df={metrics['d_fake']:.3f}  "
