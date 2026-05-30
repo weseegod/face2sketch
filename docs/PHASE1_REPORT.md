@@ -1,8 +1,7 @@
 # Phase 1 Report — pix2pix GAN: Photo → Sketch
 
-> **Status:** ✅ Complete  
-> **Date:** May 2026  
-> **Checkpoint:** `checkpoints/pix2pix_best.pt` (epoch 197, ~454MB)
+> **Status:** ⚠️ Retraining needed (D stabilization)  
+> **Date:** May 2026
 
 ---
 
@@ -16,62 +15,88 @@
 | Inference & visualization | `src/sample.py` | — |
 | Evaluation | `src/evaluate.py` | — |
 
-## Training Runs
+## Training History (3 attempts — all share the same root problem)
 
-Two full 200-epoch runs on T4 Colab (free tier), ~2 hours each.
+| Run | D LR | λ_L1 | Epochs | Train L1 | Test L1 | D died at |
+|-----|------|------|--------|----------|---------|-----------|
+| v1 | 2e-4 | 100 | 155 | 0.229 | 0.343 | epoch ~30 |
+| v2 | 1e-4 | 100 | 197 | 0.265 | 0.360 | epoch ~33 |
+| v3 | — | — | pending | — | — | — |
 
-| | Run 1 | Run 2 |
-|---|---|---|
-| D learning rate | 2e-4 | **1e-4** |
-| Epochs completed | 155 (early stop) | 200 |
-| Final Train G_L1 | 0.229 | 0.265 |
-| Test L1 (100 unseen) | 0.343 | 0.360 |
-| Df at end | 0.000 (dead) | 0.000 (dead) |
+**Phase 2** (caricature finetune): Two attempts, both failed to transfer style. Root cause: Phase 1 base weights lack texture/sharpness, and 184 pairs is even fewer → D dies faster. Run v2 reached Train L1=0.40 at epoch 69.
 
-**Key finding:** With only 322 training pairs, the discriminator finishes its job early (epoch ~30-40) — it memorizes all real pairs and rejects everything else. After that, training is pure L1 regression. Halving D_lr bought ~13 more epochs of useful adversarial signal but didn't fundamentally solve the data-scarcity limitation.
+## The Problem: D Dies on Small Datasets
 
-Both runs converged to roughly the same L1 on unseen test data, suggesting the model saturated what's learnable from 322 pairs.
+Every run follows the same pattern:
+
+```
+Epochs 1-30:   D alive   → adversarial signal contributes texture
+Epochs 30+:    D dead    → pure L1 regression only
+```
+
+With only 322 training pairs, the discriminator **memorizes all real images** by epoch ~30 and rejects everything else with 99.99% confidence (Df=0.000). The generator receives zero adversarial gradient — the loss that's supposed to add pencil-stroke texture and sharp lines simply stops working.
+
+**Visual symptom:** Outputs look like "black-and-white photocopies" — structurally correct faces, but no pencil-drawing texture, no sharp strokes, no artistic quality. This is the classic L1-only blur effect. L1 loss produces the *average* sketch; adversarial loss adds the *texture*.
+
+Lowering D's learning rate (v2: 1e-4 vs 2e-4) bought ~3 more epochs. Not enough.
+
+## The Fix: Spectral Norm + Noise Injection
+
+Two light-weight additions to the discriminator that prevent memorization:
+
+| Technique | What it does | Why it helps |
+|-----------|-------------|--------------|
+| **Spectral Normalization** | Bounds each D layer's weight norm by its largest singular value | Prevents D from getting too confident — limits its capacity to memorize |
+| **Noise Injection** | Adds Gaussian noise (σ=0.05) to D's inputs during training | Forces D to generalize — can't rely on exact pixel values to discriminate |
+
+Both are standard practice for small-dataset GANs. Combined, they should keep Df above 0.0 for 100+ epochs instead of 30, giving the adversarial loss time to contribute pencil-drawing texture.
+
+### Code changes
+
+```python
+# discriminator.py — two new constructor params (both default True)
+PatchGANDiscriminator(
+    ...,
+    use_spectral_norm=True,   # wraps every Conv2d in nn.utils.spectral_norm
+    noise_std=0.05,           # adds randn_like(x) * 0.05 to D's forward()
+)
+
+# train.py — config defaults
+"d_spectral_norm": True,
+"d_noise_std": 0.05,
+```
+
+## What Stays the Same
+
+- Architecture: UNetGenerator (ngf=64, 5 levels) + PatchGAN (ndf=64, 3 layers)
+- Loss: λ_L1=100, λ_adv=1, BCE + L1
+- Optimizer: Adam β1=0.5, G_lr=2e-4, D_lr=1e-4
+- Data: 322 pairs, 256×256, 100% training
+- Epochs: 200
 
 ## Dataset
 
 - **Training:** 322 paired (photo, sketch) — CUHK Student Sketch (188) + SKSF-A (134)
 - **Test:** 100 paired (photo, sketch) — app-generated, held out completely
-- **Resolution:** 256×256, 100% used for training (no val split)
+- **Resolution:** 256×256
 
-## What Works
+## Success Criteria
 
-- Generator produces recognizable face sketches from unseen photos
-- No mode collapse — different inputs produce different outputs
-- Training is stable — no NaN losses, no oscillations
-- Checkpoint resume works
-- Training on Colab T4 with `data.zip` upload flow works
-- Evaluation pipeline: quick visual + full L1 on unseen test set
+- [ ] Generator produces recognizable face sketches (already ✅ from v1/v2)
+- [ ] Outputs have visible pencil-stroke texture, not just blurred photocopy
+- [ ] D survives 100+ epochs (Df stays in 0.1–0.4 range)
+- [ ] Adversarial training contributes throughout, not just first 30 epochs
 
-## What's Tricky
+## Commands
 
-- **Small dataset (322 pairs):** Discriminator saturates quickly. GAN adversarial training only active for first ~30 epochs. This is a known property of pix2pix on small datasets — the paper uses thousands of pairs.
-- **L1 doesn't reach 0.15:** Test L1 plateaus around 0.35. The 0.15 target from the pix2pix paper assumes cleaner, higher-resolution academic sketches. Our test set (app-generated sketches) has inherent mismatch that inflates L1.
-- **D_lr tuning helped but didn't fully solve:** Halving discriminator learning rate extended useful adversarial training from ~20 to ~33 epochs. For larger datasets this would be enough.
+```bash
+# Colab
+python src/train.py --mode train --device cuda --name pix2pix_v3_
 
-## Artifacts
-
-```
-checkpoints/
-  pix2pix_best_1.pt    — run 1 best (epoch 155)
-  pix2pix_best.pt    — run 2 best (epoch 197) ← use this for Phase 2
-
-samples/
-  epoch_010.png ... epoch_200.png   — sample grids every 10 epochs
-
-outputs/
-  phase1_quick_eval.png             — 10 random test photos + generated
-  phase1_full_eval.png              — 8 generated vs 8 ground-truth
+# Kaggle (on P100 or T4x2)
+python src/train.py --mode train --device cuda --name pix2pix_v3_ --batch-size 24
 ```
 
-## Next: Phase 2
+## Next After Fix
 
-Load `pix2pix_best.pt` as pretrained weights, finetune on TwitterPicasso (184 caricature pairs). The photo→drawing mapping transfers — only the style needs to adapt. Fresh discriminator on a new dataset means adversarial signal will be active again.
-
-```
-python src/train.py --mode train --resume checkpoints/pix2pix_best.pt --device cuda
-```
+If Phase 1 produces sharp pencil-drawing outputs → proceed to Phase 2 finetune on caricatures with the same D stabilization fixes applied.

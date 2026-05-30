@@ -88,6 +88,10 @@ CONFIG = {
     "label_smoothing_real": 0.9, "label_smoothing_fake": 0.0,
     "grad_clip": 1.0,
 
+    # Discriminator stabilization (prevents D from dying on small datasets)
+    "d_spectral_norm": True,   # bound D's Lipschitz constant
+    "d_noise_std": 0.05,       # Gaussian noise injected to D inputs
+
     # Gradient accumulation (1 = no accumulation, 2+ = accumulate N steps)
     "grad_accum": 1,
 
@@ -114,6 +118,8 @@ def create_models(cfg, device):
     disc = PatchGANDiscriminator(
         in_channels=cfg["in_channels"] + cfg["out_channels"],
         ndf=cfg["ndf"], n_layers=cfg["n_layers"],
+        use_spectral_norm=cfg.get("d_spectral_norm", True),
+        noise_std=cfg.get("d_noise_std", 0.05),
     ).to(device)
 
     return gen, disc
