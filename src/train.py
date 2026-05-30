@@ -526,25 +526,18 @@ def train(config_path=None, resume_from=None, finetune_from=None,
             save_sample_grid(gen, sample_loader, epoch, cfg["sample_dir"],
                              device=device, num_samples=cfg["num_val_samples"])
 
-        # ── Checkpoints ──
+        # ── Checkpoints (best + final only) ──
         if is_best:
-            p = save_ckpt(gen, disc, g_opt, d_opt, epoch, val_l1, cfg, "best.pt")
-            print(f"        🏆  Best! → {p.name}")
-
-        if epoch % cfg["save_interval"] == 0:
-            p = save_ckpt(gen, disc, g_opt, d_opt, epoch, val_l1, cfg,
-                           f"epoch_{epoch:03d}.pt")
-            print(f"        💾  {p.name}")
+            save_ckpt(gen, disc, g_opt, d_opt, epoch, val_l1, cfg, "best.pt")
+            print(f"        🏆  Best! → best.pt")
 
         if epoch == max_epochs:
             p = save_ckpt(gen, disc, g_opt, d_opt, epoch, val_l1, cfg, "final.pt")
-            print(f"        💾  {p.name}")
+            print(f"        💾  final.pt")
 
         # ── Early stop ──
         if patience > 0 and plateau_count >= patience:
             print(f"        ⏹️  No improvement for {patience} epochs — stopping early")
-            p = save_ckpt(gen, disc, g_opt, d_opt, epoch, val_l1, cfg, "early_stop.pt")
-            print(f"        💾  {p.name}")
             break
 
     total_t = time.time() - t0
