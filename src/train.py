@@ -158,9 +158,35 @@ def save_ckpt(gen, disc, g_opt, d_opt, epoch, loss, cfg, fname):
 def load_pretrained_gen(path, gen, device):
     """Load only generator weights from a checkpoint (for finetuning)."""
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    gen.load_state_dict(ckpt["generator"])
+    state = ckpt["generator"]
+    # Handle DataParallel: strip/add 'module.' prefix as needed
+    model_is_dp = isinstance(gen, nn.DataParallel)
+    state_is_dp = any(k.startswith('module.') for k in state.keys())
+    if model_is_dp and not state_is_dp:
+        state = {'module.' + k: v for k, v in state.items()}
+    elif not model_is_dp and state_is_dp:
+        state = {k[7:]: v for k, v in state.items()}
+    gen.load_state_dict(state)
     print(f"📂  Loaded pretrained G from {path} (epoch {ckpt['epoch']})")
     print(f"    D and optimizers will start fresh (new style, new dataset)")
+    return ckpt["epoch"]
+
+
+def load_ckpt(path, gen, disc, g_opt, d_opt, device):
+    """Resume training — load G, D, and both optimizers."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    for model, key in [(gen, "generator"), (disc, "discriminator")]:
+        state = ckpt[key]
+        model_is_dp = isinstance(model, nn.DataParallel)
+        state_is_dp = any(k.startswith('module.') for k in state.keys())
+        if model_is_dp and not state_is_dp:
+            state = {'module.' + k: v for k, v in state.items()}
+        elif not model_is_dp and state_is_dp:
+            state = {k[7:]: v for k, v in state.items()}
+        model.load_state_dict(state)
+    g_opt.load_state_dict(ckpt["g_optimizer"])
+    d_opt.load_state_dict(ckpt["d_optimizer"])
+    print(f"📂  Resumed from {path} (epoch {ckpt['epoch']})")
     return ckpt["epoch"]
 
 
