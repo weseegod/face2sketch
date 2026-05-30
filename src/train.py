@@ -67,6 +67,13 @@ CONFIG = {
         "num_val_samples": 4, "log_interval": 10,
         "patience": 0,
     },
+    "train": {
+        "max_epochs": 200, "batch_size": 16, "image_size": 256,
+        "ngf": 64, "num_levels": 5, "ndf": 64,
+        "sample_interval": 10, "save_interval": 20,
+        "num_val_samples": 8, "log_interval": 50,
+        "patience": 20,
+    },
     "finetune": {
         "max_epochs": 100, "batch_size": 16, "image_size": 256,
         "ngf": 64, "num_levels": 5, "ndf": 64,
