@@ -367,6 +367,9 @@ def train(config_path=None, resume_from=None, finetune_from=None,
         cfg["g_lr"] = cfg["lr_override"]
         cfg["d_lr"] = cfg["lr_override"] / 2
         print(f"    ⚡  LR override: G={cfg['g_lr']}, D={cfg['d_lr']}")
+    if cfg.get("patience_override") is not None:
+        cfg["patience"] = cfg["patience_override"]
+        print(f"    ⏱️   Patience override: {cfg['patience']}")
 
     # ── Data ──
     print(f"\n📦  Data: {cfg['data_dir']}")
@@ -588,6 +591,8 @@ if __name__ == "__main__":
                    help="Override batch size (Kaggle T4x2: use 32-48)")
     p.add_argument("--lr", type=float, default=None,
                    help="Override G learning rate")
+    p.add_argument("--patience", type=int, default=None,
+                   help="Override early stopping patience (0=disable)")
     args = p.parse_args()
 
     if args.mode:
@@ -600,6 +605,9 @@ if __name__ == "__main__":
         CONFIG["batch_size_override"] = args.batch_size
     if args.lr:
         CONFIG["lr_override"] = args.lr
+
+    if args.patience is not None:
+        CONFIG["patience_override"] = args.patience
 
     train(config_path=args.config, resume_from=args.resume,
           finetune_from=args.finetune,
