@@ -14,16 +14,19 @@ Usage:
 
 import argparse
 import os
+import sys
 import json
 import time
 from pathlib import Path
 
+# Ensure src/ is on path when running from repo root
+sys.path.insert(0, str(Path(__file__).parent))
+
 import torch
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import DataLoader
 
-from data_loader import FaceDataset, get_dataloaders, MEAN, MEAN_STD, FINETUNE_MEAN, FINETUNE_STD
+from data_loader import get_dataloaders, MEAN, MEAN_STD, FINETUNE_MEAN, FINETUNE_STD
 from diffusion import DiffusionModel
 
 # ── Default config ──
