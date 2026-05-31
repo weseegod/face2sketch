@@ -15,7 +15,7 @@ model:
     dropout: 0.5
 
   discriminator:
-    ndf: 32
+    ndf: 48
     n_layers: 3
     use_batchnorm: true
     leaky_slope: 0.2

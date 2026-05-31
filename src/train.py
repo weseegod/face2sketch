@@ -49,7 +49,7 @@ CONFIG = {
     "in_channels": 3,
     "out_channels": 3,
     "ngf": 64, "num_levels": 5, "use_dropout": True, "dropout": 0.5,
-    "ndf": 32, "n_layers": 3,
+    "ndf": 48, "n_layers": 3,
 
     # Data
     "data_dir": "data/dataset",
@@ -69,14 +69,14 @@ CONFIG = {
     },
     "train": {
         "max_epochs": 200, "batch_size": 16, "image_size": 256,
-        "ngf": 64, "num_levels": 5, "ndf": 32,
+        "ngf": 64, "num_levels": 5, "ndf": 48,
         "sample_interval": 10, "save_interval": 20,
         "num_val_samples": 8, "log_interval": 50,
         "patience": 20,
     },
     "finetune": {
         "max_epochs": 100, "batch_size": 16, "image_size": 256,
-        "ngf": 64, "num_levels": 5, "ndf": 32,
+        "ngf": 64, "num_levels": 5, "ndf": 48,
         "sample_interval": 10, "save_interval": 20,
         "num_val_samples": 8, "log_interval": 50,
         "patience": 20,
@@ -97,7 +97,7 @@ CONFIG = {
 
     # Discriminator stabilization (prevents D from dying on small datasets)
     "d_spectral_norm": True,   # bound D's Lipschitz constant
-    "d_noise_std": 0.1,        # Gaussian noise injected to D inputs
+    "d_noise_std": 0.07,       # Gaussian noise injected to D inputs
 
     # Gradient accumulation (1 = no accumulation, 2+ = accumulate N steps)
     "grad_accum": 1,
