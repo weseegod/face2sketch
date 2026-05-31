@@ -194,12 +194,12 @@ class TestConditionalUNet(unittest.TestCase):
         self.assertTrue(has_grad, "No parameters received gradients")
 
     def test_zero_output_initially(self):
-        """Output conv is zero-initialized — initial outputs should be near zero."""
+        """Output conv is NOT zero-initialized — initial outputs should be non-zero."""
         x = torch.randn(2, 6, 64, 64)
         t = torch.randint(0, 1000, (2,))
         out = self.model(x, t)
-        # Initial output should be small due to zero-init last conv
-        self.assertLess(out.abs().max().item(), 1.0)
+        # With kaiming init, output should be non-zero
+        self.assertGreater(out.abs().mean().item(), 0.0)
 
 
 class TestDiffusionModel(unittest.TestCase):

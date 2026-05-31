@@ -424,10 +424,6 @@ class ConditionalUNet(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
 
-        # Zero-initialize the last conv of output for stability
-        nn.init.constant_(self.output_conv.weight, 0.0)
-        nn.init.constant_(self.output_conv.bias, 0.0)
-
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """x: (B, 6, H, W) = concat(photo, noisy_sketch), t: (B,) timesteps"""
         # ── Time embedding ──
