@@ -209,6 +209,71 @@ def evaluate_full(gen, test_pairs, device):
 
 
 # ═══════════════════════════════════════════════════════════════
+#  PHASE 3: EVALUATE DIFFUSION MODEL
+# ═══════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def evaluate_diffusion(model, test_dir, device, num_steps=50):
+    """Evaluate a trained diffusion model on test data.
+
+    Generates sketches via DDIM sampling, computes L1 against ground-truth,
+    and saves a comparison grid.
+    """
+    from diffusion import DiffusionModel
+    import torch.nn as nn
+
+    test_pairs = get_test_pairs(test_dir)
+    paired = [p for p in test_pairs if p["sketch"] is not None]
+
+    if not paired:
+        print(f"  ⚠️  No paired test sketches found in {test_dir}")
+        return
+
+    print(f"  Test pairs: {len(paired)}")
+
+    # Compare first 8 for grid
+    samples = paired[:8]
+    photos_list, fakes_list, reals_list = [], [], []
+    l1_fn = nn.L1Loss()
+    total_l1 = 0.0
+    count = 0
+
+    for p in tqdm(samples, desc="  Sampling (DDIM)"):
+        photo_t = preprocess(p["photo"]).to(device)
+        sketch_t = preprocess(p["sketch"]).to(device)
+
+        generated = model.sample(photo_t, num_steps=num_steps)
+
+        photos_list.append(postprocess_tensor(photo_t.cpu()))
+        fakes_list.append(postprocess_tensor(generated.cpu()))
+        reals_list.append(postprocess_tensor(sketch_t.cpu()))
+        total_l1 += l1_fn(generated, sketch_t).item()
+        count += 1
+
+    avg_l1 = total_l1 / count if count > 0 else float("inf")
+
+    # Grid: photos | generated | ground-truth
+    from torchvision.utils import make_grid, save_image as tv_save
+    p_grid = make_grid(torch.cat(photos_list), nrow=8)
+    g_grid = make_grid(torch.cat(fakes_list), nrow=8)
+    r_grid = make_grid(torch.cat(reals_list), nrow=8)
+    combined = torch.cat([p_grid, g_grid, r_grid], dim=1)
+
+    out_path = Path("outputs") / "phase3_test_eval.png"
+    out_path.parent.mkdir(exist_ok=True)
+    tv_save(combined, out_path)
+
+    print(f"\n  📊  Phase 3 Test Results")
+    print(f"      Test pairs:      {count}")
+    print(f"      Avg L1:          {avg_l1:.4f}")
+    print(f"      DDIM steps:      {num_steps}")
+    print(f"      Grid saved:      {out_path}")
+    print(f"         Row 1 = photos  |  Row 2 = generated  |  Row 3 = ground-truth")
+
+    return avg_l1
+
+
+# ═══════════════════════════════════════════════════════════════
 #  MODE 3: COMPARE — up to 4 checkpoints side-by-side
 # ═══════════════════════════════════════════════════════════════
 

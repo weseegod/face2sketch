@@ -1,0 +1,31 @@
+# Phase 3: Conditional DDPM — Configuration
+# Trains noise-predicting U-Net on (photo, sketch) pairs.
+# No discriminator — just MSE between predicted and actual noise.
+
+T: 1000               # Total diffusion timesteps
+schedule: "cosine"    # Cosine β schedule (Nichol & Dhariwal 2021)
+base_ch: 64           # Base channel count for U-Net
+time_dim: 256         # Time embedding dimension
+groups: 32            # GroupNorm groups
+dropout: 0.1          # ResBlock dropout
+
+# Training
+lr: 2.0e-4           # AdamW learning rate
+epochs: 500           # Total epochs
+batch_size: 8         # Batch size per GPU
+grad_accum_steps: 1   # Gradient accumulation steps
+val_every: 25         # Validate every N epochs
+patience: 100         # Early stopping patience (0 = no early stop)
+clip_grad: 1.0        # Gradient clipping norm
+
+# Data
+val_fraction: 0.10    # Fraction for validation
+test_fraction: 0.05   # Fraction for test
+image_size: 256       # Input/output resolution
+num_workers: 2        # DataLoader workers
+
+# Sampling (for validation visuals)
+sample_steps: 50      # DDIM steps for validation sampling
+
+# AMP
+amp: true             # Automatic Mixed Precision (CUDA only)
