@@ -22,13 +22,13 @@ Build everything yourself, understand every line. Same philosophy: no black boxe
 
 ---
 
-## 🗺️ Three Phases
+## 🗺️ Four Phases
 
 ```
-Phase 1 ──────► Phase 2 ──────► Phase 3
-pix2pix GAN    Finetune to    Upgrade to
-Photo→Sketch   Caricature     Diffusion
-1-2 weeks      1 week         2-3 weeks
+Phase 1 ──────► Phase 2 ──────► Phase 3 ──────► Phase 4
+pix2pix GAN    Finetune to    DDPM from       ControlNet
+Photo→Sketch   Caricature     Scratch         + LoRA
+✅ DONE        ❌ GAN limit   Educational     Production
 ```
 
 ---
@@ -163,103 +163,156 @@ This is the same principle as fine-tuning a pretrained LLM — the base knowledg
 
 ---
 
-## 📋 Phase 3: Upgrade to Conditional Diffusion (2-3 weeks)
+## 📋 Phase 3: Conditional DDPM from Scratch — Educational (2-3 weeks)
 
-### Why Upgrade?
+### Why DDPM First?
 
-- **Diversity:** GANs can produce only one output per input. Diffusion can generate multiple different caricatures from the same photo.
-- **Quality at scale:** Diffusion scales better with compute and data.
-- **Industry SOTA:** Most production image generation systems (Midjourney, DALL-E, SD) use diffusion.
+Before using black-box production systems (ControlNet), you need to understand how diffusion actually works: forward noising process, reverse denoising, noise prediction, DDIM sampling. Building a DDPM from scratch teaches you the internals that every diffusion-based system is built on.
 
-### Two Sub-Paths
-
-#### Path A: ControlNet + LoRA on Stable Diffusion (Production)
-
-```
-  Face Photo ──► ControlNet (frozen) ──► Guides diffusion process
-                                           │
-  Random Noise ──► SD U-Net + LoRA ────────┤
-                                           ▼
-                                    Funny Caricature
-```
-
-- Use pretrained Stable Diffusion 1.5 (~860M params)
-- Add ControlNet conditioned on face photo
-- Train only ControlNet + LoRA weights (~20M params)
-- **Pros:** Works with 184 pairs, production quality, fast training
-- **Cons:** Less "from scratch" understanding, depends on external model
-
-#### Path B: Conditional DDPM from Scratch (Educational)
+### Approach
 
 ```
   Photo + Noisy Sketch ──► Conditional U-Net ──► Predicted Noise
   (concatenated)
 ```
 
-- Build DDPM/DDIM scheduler from scratch
-- Modify Phase 1 U-Net to accept 6 input channels (photo + noisy target)
-- **Pros:** Deep understanding of diffusion internals
-- **Cons:** Needs 5K-20K images for decent quality, long training time
+- Build DDPM/DDIM scheduler from scratch (no diffusers, no HuggingFace)
+- Reuse Phase 1 U-Net architecture, modify to 6 input channels (photo + noisy target)
+- Train on CUHK + SKSF-A (322 pairs) for proof-of-concept
+- Then try on TwitterPicasso (184 pairs) with the same architecture
 
-### Recommendation
+### Why This Might Work for Caricatures
 
-Do **both** — start with Path B on a small scale to understand the fundamentals (train on ~500 generated pairs), then do Path A for actual production-quality results. This teaches you both: the internals AND how production systems actually work.
+Unlike GANs, DDPM doesn't need a discriminator. The loss is simple: predict the noise that was added to the image. No adversarial balance to maintain, no D dying on small data. The model learns a distribution over possible outputs — which means it can generate different caricatures from the same photo (diversity that GANs can't provide).
+
+### What You Build
+
+| Component | File | What You Learn |
+|-----------|------|----------------|
+| **DDPM Scheduler** | `src/diffusion.py` | Forward diffusion (add noise), reverse process, β schedule |
+| **DDIM Sampler** | `src/diffusion.py` | Fast deterministic sampling, skip-step inference |
+| **Noise Predictor** | `src/unet.py` (modified) | Conditional U-Net that predicts noise given photo + noisy sketch |
+
+### Architecture
+
+```
+Noise Predictor (modified Phase 1 U-Net):
+  Input: concatenated(photo, noisy_sketch, timestep_embedding) → 6+ channels
+  Encoder: same 5-level structure as Phase 1
+  Bottleneck: same
+  Decoder: same 5-level structure + skip connections
+  Output: predicted noise (3 channels)
+```
+
+### Loss
+
+```
+L = MSE(ε, ε_θ(photo, noisy_sketch, t))
+```
+
+Where ε is the actual noise added, ε_θ is the model's prediction. Simple, stable, no adversarial dynamics.
+
+### Schedule
+
+| Week | Task |
+|------|------|
+| 1 | Implement DDPM scheduler (forward + reverse) |
+| 1 | Implement noise predictor U-Net (timestep embedding, conditioning) |
+| 2 | Train on synthetic data: add known noise, verify recovery |
+| 2-3 | Train on CUHK (322 pairs), then TwitterPicasso (184 pairs) |
+| 3 | Implement DDIM sampling for fast inference |
+
+### Success Criteria
+
+- [ ] Forward diffusion: clean sketch → pure noise over T steps
+- [ ] Reverse diffusion: pure noise → recognizable sketch
+- [ ] Conditioning works: photo guides the denoising to the correct face
+- [ ] DDIM sampling: generates in 20-50 steps instead of 1000
+- [ ] Diversity: same photo produces different sketches on different runs
 
 ---
 
-## 📊 Full Training Budget (L4 Colab)
+## 📋 Phase 4: ControlNet + LoRA on Stable Diffusion — Production (2-3 weeks)
 
-| Phase | Approach | Epochs | Batch | Resolution | Time |
-|-------|----------|--------|-------|------------|------|
-| 1: pix2pix | GAN from scratch | 200 | 16 | 256×256 | ~1.5h |
-| 2: Finetune | GAN transfer | 100 | 16 | 256×256 | ~45min |
-| 3: SD+ControlNet | Diffusion adapter | ~50 | 4 | 512×512 | ~4-6h |
-| 3 alt: DDPM | Diffusion from scratch | ~1000 | 8 | 256×256 | ~20h+ |
-| **Total** | | | | | **~7h (GAN path)** |
+### Why ControlNet?
+
+Once you understand diffusion fundamentals from Phase 3, ControlNet is the production-grade way to do conditional generation. Instead of training from scratch, you leverage Stable Diffusion 1.5 — a model trained on billions of images that already knows how to draw faces, textures, and lighting.
+
+### Approach
+
+```
+  Face Photo ──► ControlNet (trainable) ──► Guides SD denoising
+                                               │
+  Random Noise ──► SD 1.5 U-Net + LoRA ────────┤
+                                               ▼
+                                        Caricature Output
+```
+
+- Use pretrained SD 1.5 (~860M params, frozen)
+- Train ControlNet to extract spatial structure from face photos
+- Train LoRA (~20M params) on SD U-Net for TwitterPicasso style
+- Combined: photo drives structure, LoRA drives style
+
+### Why This Works with 184 Pairs
+
+- **ControlNet:** Pre-trained face ControlNet already exists (MediaPipe face, Canny edges). Only fine-tune, not train from scratch.
+- **LoRA:** Designed for few-shot style adaptation. 184 pairs is a reasonable LoRA dataset. Adds small trainable adapters to frozen SD layers.
+- **No discriminator needed.** Diffusion's denoising objective is inherently stable.
+
+### What You Build
+
+| Component | File | What You Learn |
+|-----------|------|----------------|
+| **ControlNet** | `src/controlnet.py` | Zero-convolution, locked encoder copy, spatial conditioning |
+| **LoRA Adapter** | `src/lora.py` | Low-rank decomposition, trainable adapters on frozen weights |
+| **SD Pipeline** | `src/pipeline.py` | Text-to-image with ControlNet + LoRA, CFG guidance |
+
+### Budget
+
+| | Phase 3 (DDPM) | Phase 4 (ControlNet) |
+|---|---|---|
+| GPU | T4/P100 | T4/P100 |
+| Resolution | 256×256 | 512×512 |
+| Epochs | ~500-1000 | ~50 |
+| Time | ~10-20h | ~4-6h |
+| VRAM | ~8GB | ~12GB |
+
+### Phase Gates
+
+#### Phase 3 → Phase 4: GO when
+- [ ] DDPM generates recognizable face sketches from photos
+- [ ] Conditioning works: photo controls output structure
+- [ ] DDIM sampling produces results in <50 steps
+- [ ] Understanding of diffusion internals is solid
+
+#### Phase 4 → Ship: GO when
+- [ ] Caricature style transfers to new photos
+- [ ] Face identity is preserved (looks like the input person)
+- [ ] Multiple different caricatures possible from same photo
+- [ ] Fun factor: images make you smile 😄
 
 ---
 
-## 📚 Reading List (by phase)
+## 📚 Reading List
 
-### Phase 1
-- [pix2pix (Isola et al. 2017)](https://arxiv.org/abs/1611.07004) — the canonical paired image translation paper
-- [GANs in 50 lines of PyTorch](https://medium.com/@devnag/generative-adversarial-networks-gans-in-50-lines-of-code-pytorch-e81b79659e3f) — intuition
-- [U-Net (Ronneberger et al. 2015)](https://arxiv.org/abs/1505.04597) — original U-Net paper for segmentation
-- [PatchGAN explained](https://machinelearningmastery.com/a-gentle-introduction-to-pix2pix-generative-adversarial-network/) — blog post
+### Phase 1 — GANs
+- [pix2pix (Isola et al. 2017)](https://arxiv.org/abs/1611.07004)
+- [U-Net (Ronneberger et al. 2015)](https://arxiv.org/abs/1505.04597)
+- [PatchGAN explained](https://machinelearningmastery.com/a-gentle-introduction-to-pix2pix-generative-adversarial-network/)
 
-### Phase 2
-- [Transfer Learning in GANs](https://arxiv.org/abs/1812.04948) — few-shot GAN adaptation
-- [pix2pixHD (Wang et al. 2018)](https://arxiv.org/abs/1711.11585) — multi-scale, perceptual loss
+### Phase 2 — GAN Transfer
+- [Transfer Learning in GANs](https://arxiv.org/abs/1812.04948)
 
-### Phase 3
+### Phase 3 — DDPM from Scratch
 - [DDPM (Ho et al. 2020)](https://arxiv.org/abs/2006.11239) — the diffusion bible
 - [DDIM (Song et al. 2021)](https://arxiv.org/abs/2010.02502) — fast sampling
-- [ControlNet (Zhang et al. 2023)](https://arxiv.org/abs/2302.05543) — conditional control for diffusion
 - [The Annotated Diffusion Model](https://huggingface.co/blog/annotated-diffusion) — line-by-line code
+- [What are Diffusion Models? (Lil'Log)](https://lilianweng.github.io/posts/2021-07-11-diffusion-models/)
 
----
-
-## 🚦 Phase Gates
-
-### Phase 1 → Phase 2: GO when
-- [ ] Generator produces recognizable sketches from validation photos
-- [ ] Discriminator accuracy ~50-70% (not too strong, not too weak)
-- [ ] Training is stable across 200 epochs (no mode collapse)
-- [ ] L1 loss < 0.1 on validation set
-
-### Phase 2 → Phase 3: GO when
-- [ ] Fine-tuned model produces caricatures in TwitterPicasso style
-- [ ] Face identity is preserved (you can tell who the person is)
-- [ ] Outputs are noticeably different from Phase 1 (funnier, more exaggerated)
-
-### Phase 3 → Ship: GO when
-- [ ] Caricature style transfers consistently
-- [ ] Diverse outputs from same input (if using diffusion)
-- [ ] Fun factor is there — images make you smile 😄
-
----
-
-## 🏗️ Project Structure (Final)
+### Phase 4 — ControlNet + LoRA
+- [ControlNet (Zhang et al. 2023)](https://arxiv.org/abs/2302.05543)
+- [LoRA (Hu et al. 2021)](https://arxiv.org/abs/2106.09685)
+- [Stable Diffusion 1.5](https://huggingface.co/runwayml/stable-diffusion-v1-5)
 
 ```
 face2sketch/

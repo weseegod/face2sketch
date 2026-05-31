@@ -58,26 +58,30 @@ outputs/
   phase1_vs_phase2.png  — v5 sketch vs v3 "caricature" (nearly identical)
 ```
 
-## Next: Phase 3 — ControlNet + LoRA on Stable Diffusion
+## Next: Phase 3 — Conditional DDPM from Scratch
 
-### Why ControlNet
+### Why DDPM (not ControlNet yet)
 
-- **No discriminator needed.** Diffusion models learn to denoise images — no adversarial balance, no D dying on small data.
-- **SD 1.5 already knows how to draw.** After training on billions of images, SD has deep visual understanding. ControlNet just needs to map face structure as a condition.
-- **LoRA is designed for few-shot style transfer.** 184 pairs is actually a reasonable LoRA dataset. LoRA adds small trainable adapters to a frozen base model, making it ideal for limited data.
-- **Industry standard.** ControlNet + LoRA is how production systems (Midjourney-style services, AI avatar apps) do conditional image generation.
+The learning roadmap now splits into two diffusion phases:
 
-### Plan
+- **Phase 3 (Path B):** Build DDPM/DDIM from scratch. No Stable Diffusion, no HuggingFace. Understand every line of the forward noising process, reverse denoising, noise prediction, and fast sampling. Use the same U-Net architecture from Phase 1, modified for noise prediction with timestep conditioning.
 
-```
-Face Photo ──► ControlNet (frozen) ──► Guides SD denoising process
-                                              │
-Random Noise ──► SD 1.5 U-Net + LoRA ─────────┤
-                                              ▼
-                                       Caricature Output
-```
+- **Phase 4 (Path A):** ControlNet + LoRA on Stable Diffusion 1.5. Production-grade conditional generation. Leverage pretrained SD for quality, train only adapters on 184 pairs.
 
-- Train ControlNet to map face photo → spatial condition
-- Train LoRA on SD 1.5 U-Net to adapt style to TwitterPicasso
-- Combined inference: photo drives structure, LoRA drives style
-- ~50 epochs, ~4-6 hours on T4/P100
+Phase 3 comes first because: understanding diffusion internals before using production wrappers. Same philosophy as Phase 1/2 — build from scratch, then upgrade.
+
+### Why DDPM Might Work Where GAN Failed
+
+- **No discriminator.** Loss is simple MSE on predicted noise — no adversarial balance, no D dying on small data.
+- **Distribution learning.** DDPM learns a distribution over outputs, so 184 pairs teach it the full style space rather than point estimates.
+- **Conditioning is explicit.** Photo is concatenated as input channel — direct structural guidance without adversarial dynamics.
+
+### What to Build
+
+| Component | File | 
+|-----------|------|
+| **DDPM Scheduler** | `src/diffusion.py` |
+| **DDIM Sampler** | `src/diffusion.py` |
+| **Noise Predictor U-Net** | `src/unet.py` (extended) |
+| **Training Loop** | `src/train_diffusion.py` |
+| **Inference** | `src/sample.py` (extended) |
