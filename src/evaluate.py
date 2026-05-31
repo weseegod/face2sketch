@@ -209,38 +209,40 @@ def evaluate_full(gen, test_pairs, device):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  MODE 3: COMPARE — Phase 1 vs Phase 2 side-by-side
+#  MODE 3: COMPARE — up to 4 checkpoints side-by-side
 # ═══════════════════════════════════════════════════════════════
 
-def evaluate_compare(checkpoint1, checkpoint2, test_pairs, device, num_samples=8):
-    """Generate side-by-side: photo | Phase 1 output | Phase 2 output."""
+def evaluate_compare(checkpoints, test_pairs, device, num_samples=8):
+    """Generate side-by-side: photo | ckpt1 output | ckpt2 output | ..."""
+    models = []
+    names = []
+    for path in checkpoints:
+        gen, ep, l1 = load_checkpoint(path, device)
+        models.append(gen)
+        names.append(f"{Path(path).stem}")
+        print(f"  [{len(models)}] {Path(path).name} (epoch {ep}, G_L1={l1:.4f})")
+
     print(f"\n  {'='*56}")
-    print(f"  ⚖️  COMPARE — Phase 1 vs Phase 2")
+    print(f"  ⚖️  COMPARISON — {len(models)} checkpoints")
     print(f"  {'='*56}")
-
-    gen1, ep1, l1_1 = load_checkpoint(checkpoint1, device)
-    gen2, ep2, l1_2 = load_checkpoint(checkpoint2, device)
-
-    print(f"  Phase 1: {Path(checkpoint1).name} (epoch {ep1}, G_L1={l1_1})")
-    print(f"  Phase 2: {Path(checkpoint2).name} (epoch {ep2}, G_L1={l1_2})")
 
     n = min(num_samples, len(test_pairs))
     samples = random.sample(test_pairs, n)
 
-    photos, fakes1, fakes2 = [], [], []
+    photos_list = []
+    fake_lists = [[] for _ in models]
+
     with torch.no_grad():
         for s in tqdm(samples, desc="  Generating", leave=False):
             photo_t = preprocess(s["photo"]).to(device)
-            f1 = gen1(photo_t)
-            f2 = gen2(photo_t)
-            photos.append(postprocess_tensor(photo_t.cpu()))
-            fakes1.append(postprocess_tensor(f1.cpu()))
-            fakes2.append(postprocess_tensor(f2.cpu()))
+            photos_list.append(postprocess_tensor(photo_t.cpu()))
+            for i, model in enumerate(models):
+                fake = model(photo_t)
+                fake_lists[i].append(postprocess_tensor(fake.cpu()))
 
-    grid_photos = make_grid(torch.cat(photos), nrow=n)
-    grid_p1 = make_grid(torch.cat(fakes1), nrow=n)
-    grid_p2 = make_grid(torch.cat(fakes2), nrow=n)
-    combined = torch.cat([grid_photos, grid_p1, grid_p2], dim=1)
+    grid_photos = make_grid(torch.cat(photos_list), nrow=n)
+    grids = [grid_photos] + [make_grid(torch.cat(fl), nrow=n) for fl in fake_lists]
+    combined = torch.cat(grids, dim=1)
 
     out_dir = Path("outputs")
     out_dir.mkdir(exist_ok=True)
@@ -248,12 +250,9 @@ def evaluate_compare(checkpoint1, checkpoint2, test_pairs, device, num_samples=8
     save_image(combined, path)
 
     print(f"\n  📸  Saved: {path}")
-    print(f"      Top row    = {n} test photos")
-    print(f"      Middle row = Phase 1 outputs")
-    print(f"      Bot row    = Phase 2 outputs")
-    print(f"\n  ❓  Are Phase 2 outputs visibly DIFFERENT from Phase 1?")
-    print(f"     Different style, bolder lines, exaggerated = working")
-    print(f"     Nearly identical = style didn't transfer")
+    print(f"      Row 1 = {n} test photos")
+    for i, name in enumerate(names):
+        print(f"      Row {i+2} = {name}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -265,6 +264,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", default=None, help="Path to .pt checkpoint")
     parser.add_argument("--checkpoint2", default=None,
                         help="Second checkpoint (for compare mode)")
+    parser.add_argument("--checkpoints", nargs="+", default=None,
+                        help="Multiple checkpoints for compare mode (v3 v4 v5)")
     parser.add_argument("--mode", choices=["quick", "full", "compare"], default="quick",
                         help="quick=10 random | full=all+L1 | compare=Phase 1 vs Phase 2")
     parser.add_argument("--device", default="cpu", help="Device: cuda or cpu")
@@ -274,20 +275,26 @@ if __name__ == "__main__":
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    # Compare mode: needs two checkpoints
+    # Compare mode: needs at least 2 checkpoints (--checkpoints or --checkpoint + --checkpoint2)
     if args.mode == "compare":
-        if not args.checkpoint or not args.checkpoint2:
-            print("❌  Compare mode needs --checkpoint AND --checkpoint2")
+        ckpts = args.checkpoints or []
+        if args.checkpoint:
+            ckpts.insert(0, args.checkpoint)
+        if args.checkpoint2:
+            ckpts.append(args.checkpoint2)
+        if len(ckpts) < 2:
+            print("❌  Compare mode needs at least 2 checkpoints")
+            print("    Use: --checkpoints ckpt1.pt ckpt2.pt ckpt3.pt")
             sys.exit(1)
         print(f"\n{'='*60}")
-        print(f"📋  Phase 1 vs Phase 2 Comparison")
+        print(f"📋  Multi-Checkpoint Comparison ({len(ckpts)} models)")
         print(f"{'='*60}")
         print(f"  Device: {device}")
         test_pairs = get_test_pairs(args.test_dir)
         if not test_pairs:
             print(f"\n  ❌  No test photos found in {args.test_dir}/photos/")
             sys.exit(1)
-        evaluate_compare(args.checkpoint, args.checkpoint2, test_pairs, device)
+        evaluate_compare(ckpts, test_pairs, device)
         sys.exit(0)
 
     if not args.checkpoint:
