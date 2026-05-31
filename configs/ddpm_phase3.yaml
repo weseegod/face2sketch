@@ -28,4 +28,4 @@ num_workers: 2        # DataLoader workers
 sample_steps: 50      # DDIM steps for validation sampling
 
 # AMP
-amp: true             # Automatic Mixed Precision (CUDA only)
+amp: false            # Automatic Mixed Precision (DISABLED for diffusion — float16 underflows small β values)

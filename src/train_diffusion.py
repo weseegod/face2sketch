@@ -92,9 +92,17 @@ def train_epoch(model, loader, optimizer, scaler, device, grad_accum, use_amp):
         if use_amp:
             with autocast():
                 loss = model.training_loss(photos, sketches) / grad_accum
-            scaler.scale(loss).backward()
         else:
             loss = model.training_loss(photos, sketches) / grad_accum
+
+        # NaN guard — skip batch BEFORE backward
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"\n  ⚠️  NaN/Inf loss at batch {batch_idx} — skipping")
+            continue
+
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
             loss.backward()
 
         total_loss += loss.item() * grad_accum
