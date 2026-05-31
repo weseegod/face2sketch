@@ -45,7 +45,7 @@ CONFIG = {
     "val_every": 25,
     "save_every": 100,
     "image_size": 256,
-    "amp": True,
+    "amp": False,   # disabled — float16 underflows small β values in diffusion
     "clip_grad": 1.0,
     "ema_decay": 0.9999,
     "num_workers": 2,
