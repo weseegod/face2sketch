@@ -296,11 +296,11 @@ def main():
 
             # Early stopping
             if args.patience > 0 and patience_counter >= args.patience:
-                print(log_str)
-                print(f"  ⏹️  Early stop at epoch {epoch+1}")
+                print(log_str, flush=True)
+                print(f"  ⏹️  Early stop at epoch {epoch+1}", flush=True)
                 break
 
-        print(log_str)
+        print(log_str, flush=True)
 
     # ── Final checkpoint ──
     final_val = validate(model, val_loader, device)
