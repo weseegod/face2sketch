@@ -15,7 +15,6 @@ Usage:
 import argparse
 import os
 import sys
-import json
 import time
 from pathlib import Path
 
@@ -24,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import torch
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
 
 from data_loader import get_dataloaders, MEAN, MEAN_STD, FINETUNE_MEAN, FINETUNE_STD
 from diffusion import DiffusionModel
@@ -72,12 +70,10 @@ def parse_args():
                         help="Resume from checkpoint path")
     parser.add_argument("--finetune", default=None,
                         help="Load pretrained model for finetuning")
-    parser.add_argument("--no-amp", action="store_true",
-                        help="Disable AMP")
     return parser.parse_args()
 
 
-def train_epoch(model, loader, optimizer, scaler, device, grad_accum, use_amp):
+def train_epoch(model, loader, optimizer, device, grad_accum):
     """One training epoch. Returns average loss."""
     model.model.train()
     total_loss = 0.0
@@ -89,34 +85,21 @@ def train_epoch(model, loader, optimizer, scaler, device, grad_accum, use_amp):
         photos = photos.to(device)
         sketches = sketches.to(device)
 
-        if use_amp:
-            with autocast():
-                loss = model.training_loss(photos, sketches) / grad_accum
-        else:
-            loss = model.training_loss(photos, sketches) / grad_accum
+        loss = model.training_loss(photos, sketches) / grad_accum
 
         # NaN guard — skip batch BEFORE backward
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"\n  ⚠️  NaN/Inf loss at batch {batch_idx} — skipping")
             continue
 
-        if use_amp:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        loss.backward()
 
         total_loss += loss.item() * grad_accum
         n_batches += 1
 
         if (batch_idx + 1) % grad_accum == 0:
-            if use_amp:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.model.parameters(), CONFIG["clip_grad"])
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(model.model.parameters(), CONFIG["clip_grad"])
-                optimizer.step()
+            torch.nn.utils.clip_grad_norm_(model.model.parameters(), CONFIG["clip_grad"])
+            optimizer.step()
             optimizer.zero_grad()
 
     return total_loss / max(n_batches, 1)
@@ -206,8 +189,7 @@ def main():
     print(f"  T={CONFIG['T']}  |  schedule={CONFIG['schedule']}  |  base_ch={CONFIG['base_ch']}")
     print(f"  val_every={args.val_every}  |  patience={args.patience}")
     # ⚠️ AMP disabled for diffusion — float16 underflows small β values
-    use_amp = False
-    print(f"  AMP: {use_amp}  |  Grad accum: {args.grad_accum_steps}")
+    print(f"  AMP: False  |  Grad accum: {args.grad_accum_steps}")
     print()
 
     # ── Data ──
@@ -246,7 +228,6 @@ def main():
 
     # ── Optimizer ──
     optimizer = optim.AdamW(model.model.parameters(), lr=args.lr, betas=(0.9, 0.999))
-    scaler = GradScaler() if use_amp else None
 
     # ── Resume or fresh start ──
     start_epoch = 0
@@ -286,8 +267,8 @@ def main():
         epoch_start = time.time()
 
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, scaler, device,
-                                 args.grad_accum_steps, use_amp)
+        train_loss = train_epoch(model, train_loader, optimizer, device,
+                                 args.grad_accum_steps)
 
         epoch_time = time.time() - epoch_start
 
