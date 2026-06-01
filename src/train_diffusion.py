@@ -205,7 +205,8 @@ def main():
     print(f"  Epochs: {args.epochs}  |  Batch: {args.batch_size}  |  LR: {args.lr}")
     print(f"  T={CONFIG['T']}  |  schedule={CONFIG['schedule']}  |  base_ch={CONFIG['base_ch']}")
     print(f"  val_every={args.val_every}  |  patience={args.patience}")
-    use_amp = not args.no_amp and device.type == "cuda"
+    # ⚠️ AMP disabled for diffusion — float16 underflows small β values
+    use_amp = False
     print(f"  AMP: {use_amp}  |  Grad accum: {args.grad_accum_steps}")
     print()
 
